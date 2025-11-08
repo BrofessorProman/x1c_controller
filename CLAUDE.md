@@ -11,8 +11,10 @@ This is a Raspberry Pi-based temperature controller for a 3D printer chamber hea
 - ✅ Runs as systemd service - persistent, auto-starts on boot
 - ✅ Remote access via WireGuard VPN
 - ✅ Real-time temperature graphing with dark mode
+- ✅ Comprehensive settings menu with temperature units (C/F), adjustable hysteresis, and probe renaming
 - ✅ Browser notifications and CSV logging
 - ✅ Preset configurations and settings persistence
+- ✅ Git version control with GitHub integration
 
 ## Quick Start
 
@@ -119,12 +121,29 @@ Access at: `http://<raspberry-pi-ip>:5000`
   - Useful for safety or troubleshooting
 
 #### Configuration
-- **Target Temperature**: Adjustable mid-print (0-100°C, 0.5° increments)
+- **Target Temperature**: Adjustable mid-print (0-100°C or 32-212°F, 0.5° increments)
 - **Print Time**: Hours and minutes
 - **Quick Time Adjustment**: ±5min, +15min buttons
 - **Enable Fans**: Toggle fan operation during print
 - **Enable Logging**: Toggle CSV logging (configure before starting)
 - **Settings Persistence**: Automatically saves to JSON file
+
+#### Settings Menu
+Access via ⚙️ Settings button in the header.
+- **Display Settings**:
+  - **Dark Mode**: Toggle between light and dark themes
+  - **Temperature Units**: Switch between Celsius (°C) and Fahrenheit (°F)
+    - All displays update automatically (current temp, setpoint, sensors, chart)
+    - Preference persists across sessions
+- **Control Parameters**:
+  - **Hysteresis**: Adjustable temperature band (default: 2.0°C, range: 0.5-10°C)
+    - Controls heater on/off cycling to prevent relay wear
+  - **Cooldown Time**: Adjustable duration (default: 4 hours, range: 0-12 hours)
+    - Sets length of gradual cooldown phase after print
+- **Probe Names**:
+  - **Rename Temperature Sensors**: Customize display name for each DS18B20 probe
+    - Names persist and appear throughout the interface
+    - Helps identify sensor locations (e.g., "Top Left", "Bottom Center")
 
 #### Presets
 - **Default Presets**:
@@ -147,12 +166,8 @@ Access at: `http://<raspberry-pi-ip>:5000`
 - Real-time line chart showing temperature vs setpoint
 - Updates every 5 seconds
 - Displays last 100 data points
-- Adapts colors for dark mode
-
-#### Dark Mode
-- Toggle between light and dark themes
-- Preference saved in browser localStorage
-- Chart automatically adjusts colors
+- Y-axis label adapts to selected temperature unit (°C or °F)
+- Colors automatically adapt for dark mode
 
 #### Browser Notifications
 - Requests permission on first load
@@ -196,18 +211,20 @@ Four concurrent threads:
 
 ### Temperature Control
 - **Multi-sensor averaging**: All working sensors averaged for chamber temperature
+- **Custom probe naming**: Each sensor can be renamed for easy identification
 - **Individual sensor failure handling**: Operation continues if at least one sensor works
 - **PID controller**: Kp=2.0, Ki=0.5, Kd=0.1, output_limits=(-100, 100)
-- **Hysteresis**: 2°C band (±1°C from setpoint) prevents relay cycling
+- **Configurable hysteresis**: User-adjustable temperature band (default: 2.0°C, range: 0.5-10°C) prevents relay cycling
 - **Mid-print adjustment**: Web interface can change target temperature during operation
 - **Manual override**: User can force heater/fans on/off bypassing PID
+- **Temperature units**: Display in Celsius or Fahrenheit (all calculations done in Celsius internally)
 - **ETA calculation**: Uses last 2 minutes of temperature data to estimate time to target
 
 ### Print Cycle Phases
 1. **IDLE**: Waiting for START command
 2. **HEATING**: Temperature rising to setpoint
 3. **MAINTAINING**: Within 1°C of setpoint
-4. **COOLING**: 4-hour gradual cooldown to ambient (5-minute steps)
+4. **COOLING**: Configurable gradual cooldown to ambient (default: 4 hours, 5-minute steps)
 
 After cooldown, system returns to IDLE and waits for next START command.
 
@@ -233,9 +250,9 @@ Uses BCM pin numbering.
 ## Configuration Constants
 
 Located at top of `x1c_heater.py`:
-- `HYSTERESIS = 2.0` - Temperature band in °C
+- `HYSTERESIS = 2.0` - Default temperature band in °C (user-configurable via settings menu)
 - `TEMP_UPDATE_INTERVAL = 5` - Update interval in seconds (faster for graphing)
-- `COOLDOWN_HOURS = 4` - Slow cooldown duration in hours
+- `COOLDOWN_HOURS = 4` - Default slow cooldown duration in hours (user-configurable via settings menu)
 - `COOLDOWN_STEP_INTERVAL = 300` - Cooldown step interval (5 minutes)
 - `SETTINGS_FILE = 'heater_settings.json'` - Settings persistence file
 - `MAX_HISTORY = 1000` - Maximum temperature history data points
@@ -262,6 +279,7 @@ Located at top of `x1c_heater.py`:
 
 ### Configuration
 - `POST /save_settings` - Save current configuration
+- `POST /save_advanced_settings` - Save advanced settings (hysteresis, cooldown, temp unit, probe names)
 - `POST /save_preset` - Save new preset
 - `POST /load_preset` - Load existing preset
 - `POST /adjust_time` - Add/subtract print time
@@ -273,12 +291,15 @@ Located at top of `x1c_heater.py`:
 
 ```
 x1c_controller/
+├── .git/                    # Git repository (version control)
+├── .gitignore              # Git ignore rules
 ├── x1c_heater.py           # Main application
 ├── requirements.txt         # Python dependencies
-├── heater_settings.json    # Auto-generated settings (not in git)
+├── README.md               # Project overview and quick start
 ├── CLAUDE.md               # This file - AI assistant guidance
 ├── SERVICE_MANAGEMENT.md   # Systemd service commands & deployment
 ├── TODO.md                 # Hardware tasks and future features
+├── heater_settings.json    # Auto-generated settings (not in git)
 └── venv/                   # Virtual environment (not in git)
 ```
 
@@ -336,9 +357,13 @@ When user toggles heater/fans via web interface:
 
 ### Settings Persistence
 - Saved to `heater_settings.json` in working directory
-- Updated on: Save Settings button, light toggle, preset save/load
+- Updated on: Save Settings button, Save Advanced Settings, light toggle, preset save/load
 - Loaded on startup
-- Contains: desired_temp, print_hours, print_minutes, fans_enabled, lights_enabled, logging_enabled, presets array
+- Contains:
+  - Basic settings: desired_temp, print_hours, print_minutes, fans_enabled, lights_enabled, logging_enabled
+  - Advanced settings: hysteresis, cooldown_hours, temp_unit, probe_names
+  - Presets array
+- Note: `heater_settings.json` is excluded from git (contains user-specific configuration)
 
 ### USB Light Control Options
 
@@ -358,7 +383,10 @@ When user toggles heater/fans via web interface:
 - Tested on modern Chrome, Firefox, Safari, Edge
 - Requires JavaScript enabled
 - Notification API support optional but recommended
-- localStorage used for dark mode preference
+- localStorage used for:
+  - Dark mode preference
+  - Temperature unit preference (C/F)
+  - Hysteresis and cooldown settings (synced with backend)
 - Chart.js loaded from CDN
 
 ### Performance
@@ -368,23 +396,65 @@ When user toggles heater/fans via web interface:
 - Fire monitoring: Every 1 second
 - Cooldown steps: Every 5 minutes
 
+## Version Control
+
+The project uses Git for version control and is hosted on GitHub.
+
+**Repository**: https://github.com/BrofessorProman/x1c_controller
+
+### Git Workflow
+```bash
+# Check status
+git status
+
+# Stage changes
+git add x1c_heater.py  # or git add -A for all changes
+
+# Commit changes
+git commit -m "Description of changes"
+
+# Push to GitHub (SSH configured)
+git push
+
+# View commit history
+git log --oneline
+
+# See what changed
+git diff
+```
+
+### What's Tracked in Git
+- ✅ Source code (x1c_heater.py)
+- ✅ Documentation (*.md files)
+- ✅ Dependencies (requirements.txt)
+- ✅ Git configuration (.gitignore)
+
+### What's Excluded (.gitignore)
+- ❌ User settings (heater_settings.json)
+- ❌ Log files (temperature_log*.csv)
+- ❌ Virtual environment (venv/)
+- ❌ Python cache (__pycache__/)
+
 ## Deployment Workflow
 
 ### Initial Setup
-1. Clone/copy code to Raspberry Pi
-2. Create virtual environment: `python3 -m venv venv`
-3. Install dependencies: `venv/bin/pip install -r requirements.txt`
-4. Configure GPIO permissions: `sudo usermod -a -G gpio pi`
-5. Enable 1-Wire interface: `sudo raspi-config`
-6. Set up systemd service (see SERVICE_MANAGEMENT.md)
-7. Configure WireGuard VPN for remote access (optional)
+1. Clone from GitHub: `git clone git@github.com:BrofessorProman/x1c_controller.git`
+2. Navigate to directory: `cd x1c_controller`
+3. Create virtual environment: `python3 -m venv venv`
+4. Install dependencies: `venv/bin/pip install -r requirements.txt`
+5. Configure GPIO permissions: `sudo usermod -a -G gpio pi`
+6. Enable 1-Wire interface: `sudo raspi-config`
+7. Set up systemd service (see SERVICE_MANAGEMENT.md)
+8. Configure WireGuard VPN for remote access (optional)
 
 ### Making Code Changes
 1. Edit code locally or on Pi
 2. If using virtual environment, ensure packages are installed in venv
 3. Test manually first: `venv/bin/python3 x1c_heater.py`
-4. Deploy to service: `sudo systemctl restart x1c-heater`
-5. Monitor logs: `sudo journalctl -u x1c-heater.service -f`
+4. Commit changes: `git add -A && git commit -m "Description"`
+5. Push to GitHub: `git push`
+6. Deploy to service: `sudo systemctl restart x1c-heater`
+7. Monitor logs: `sudo journalctl -u x1c-heater.service -f`
 
 ### Updating Dependencies
 1. Update requirements.txt
@@ -470,6 +540,12 @@ When setting up remote access:
 - [ ] Temperature graph updates
 - [ ] Preset loading works
 - [ ] Settings persistence works
+- [ ] Settings menu opens and closes
+- [ ] Dark mode toggle works
+- [ ] Temperature unit conversion (C/F) works
+- [ ] Probe renaming persists
+- [ ] Custom hysteresis value works
+- [ ] Custom cooldown time works
 - [ ] Fire alarm triggers (test safely!)
 - [ ] Emergency stop works
 - [ ] Cooldown completes
@@ -500,7 +576,23 @@ See `TODO.md` for planned improvements including:
 
 ## Version History
 
-**Current Version**: 2.0 (Web-based with systemd service)
+**Current Version**: 2.1 (Advanced Settings & Version Control)
+- **NEW**: Comprehensive settings modal with dark mode, temp units, hysteresis, cooldown, and probe renaming
+- **NEW**: Temperature unit switching (Celsius/Fahrenheit) with automatic conversion
+- **NEW**: User-configurable hysteresis (0.5-10°C) for heater control
+- **NEW**: User-configurable cooldown time (0-12 hours)
+- **NEW**: Custom probe naming for easy sensor identification
+- **NEW**: Git version control with GitHub integration (SSH)
+- Fully web-controlled interface
+- Systemd service integration
+- Remote access support
+- Real-time temperature graphing
+- Browser notifications
+- CSV logging
+- Preset management
+- Settings persistence
+
+**Version 2.0**: (Web-based with systemd service)
 - Fully web-controlled interface
 - Systemd service integration
 - Remote access support
@@ -511,7 +603,7 @@ See `TODO.md` for planned improvements including:
 - Preset management
 - Settings persistence
 
-**Previous Version**: 1.0 (Command-line based)
+**Version 1.0**: (Command-line based)
 - Terminal-only interface
 - Manual start/stop
 - Basic temperature control
