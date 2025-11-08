@@ -13,11 +13,13 @@ A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber
 - 📊 **Real-time Graphing** - Temperature history with Chart.js
 - 🔥 **Fire Safety** - MQ-2 sensor with automatic shutdown
 - 💾 **Data Logging** - Export temperature logs as CSV
-- 🎨 **Dark Mode** - Eye-friendly interface
+- 🎨 **Dark Mode** - Eye-friendly interface with settings modal
+- 🌡️ **Temperature Units** - Switch between Celsius and Fahrenheit
+- ⚙️ **Advanced Settings** - Configurable hysteresis, cooldown time, and probe naming
 - 🔔 **Browser Notifications** - Alerts for key events
 - 📱 **Mobile Friendly** - Responsive design for phones/tablets
 - 🔒 **Remote Access** - WireGuard VPN support
-- ⚙️ **Preset Configs** - Save and load common settings
+- 💾 **Preset Configs** - Save and load common settings
 - 🔄 **Auto-Start** - Runs as systemd service
 
 ## Quick Start
@@ -47,7 +49,8 @@ GPIO 27 → Buzzer
 ```bash
 # Clone repository
 cd ~
-git clone <your-repo-url> x1c_controller
+git clone git@github.com:BrofessorProman/x1c_controller.git
+# Or use HTTPS: git clone https://github.com/BrofessorProman/x1c_controller.git
 cd x1c_controller
 
 # Create virtual environment
