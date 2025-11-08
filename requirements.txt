@@ -1,0 +1,5 @@
+w1thermsensor>=2.0.0
+simple-pid>=2.0.0
+RPi.GPIO>=0.7.0
+Flask>=2.0.0
+# Chart.js is loaded via CDN in the web interface, no Python package needed
