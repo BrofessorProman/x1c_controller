@@ -49,9 +49,14 @@ heater_on = False
 heater_manual_override = False
 lights_on = False
 print_active = False
+print_paused = False
+warmup_complete = False
+awaiting_preheat_confirmation = False
 start_requested = False
 stop_requested = False
 emergency_stop_requested = False
+pause_requested = False
+preheat_confirmed = False
 additional_seconds = 0
 time_lock = threading.Lock()
 state_lock = threading.Lock()
@@ -78,7 +83,9 @@ status_data = {
     'lights_on': False,
     'emergency_stop': False,
     'print_active': False,
-    'phase': 'idle',  # idle, heating, maintaining, cooling
+    'print_paused': False,
+    'awaiting_preheat_confirmation': False,
+    'phase': 'idle',  # idle, warming_up, heating, maintaining, cooling
     'eta_to_target': 0,
     'print_time_remaining': 0,
     'cooldown_time_remaining': 0
@@ -152,6 +159,7 @@ def load_settings():
         'hysteresis': 2.0,
         'cooldown_hours': 4.0,
         'temp_unit': 'C',
+        'require_preheat_confirmation': False,
         'probe_names': {},
         'presets': [
             {'name': 'ABS Standard', 'temp': 60, 'hours': 8, 'minutes': 0},
@@ -366,7 +374,8 @@ def slow_cool(pid, hours=COOLDOWN_HOURS):
 def main_loop():
     global heater_on, fans_on, additional_seconds, print_active, start_requested
     global stop_requested, emergency_stop_requested, logging_enabled, log_data
-    global heater_manual_override, fans_manual_override
+    global heater_manual_override, fans_manual_override, print_paused, pause_requested
+    global warmup_complete, awaiting_preheat_confirmation, preheat_confirmed
 
     while not shutdown_requested:
         # Wait for START command from web interface
@@ -383,11 +392,26 @@ def main_loop():
             emergency_stop_requested = False
             status_data['print_active'] = True
             additional_seconds = 0
+            # Clear manual override flags when starting a new print cycle
+            heater_manual_override = False
+            fans_manual_override = False
+            status_data['heater_manual'] = False
+            status_data['fans_manual'] = False
+            # Clear pause state when starting
+            print_paused = False
+            pause_requested = False
+            status_data['print_paused'] = False
+            # Clear warmup state when starting
+            warmup_complete = False
+            awaiting_preheat_confirmation = False
+            preheat_confirmed = False
+            status_data['awaiting_preheat_confirmation'] = False
 
         # Get settings
         desired_temp = current_settings['desired_temp']
         print_duration_seconds = (current_settings['print_hours'] * 3600) + \
                                 (current_settings['print_minutes'] * 60)
+        require_confirmation = current_settings.get('require_preheat_confirmation', False)
 
         # Initialize logging if enabled
         if logging_enabled:
@@ -405,26 +429,14 @@ def main_loop():
         # PID Setup
         pid = PID(Kp=2.0, Ki=0.5, Kd=0.1, setpoint=desired_temp, output_limits=(-100, 100))
 
-        start_time = time.time()
-        status_data['phase'] = 'heating'
+        # Warming up phase - reach target temp before starting timer
+        status_data['phase'] = 'warming_up'
+        print(f"\nWarming up chamber to {desired_temp}°C...")
 
-        print(f"\nStarting print cycle: {desired_temp}°C for {print_duration_seconds/60:.1f} minutes")
-
-        # Main control loop
         while print_active and not shutdown_requested:
-            current_time = time.time()
-            elapsed = current_time - start_time
-
-            with time_lock:
-                remaining = print_duration_seconds + additional_seconds - elapsed
-
-            # Check for stop conditions
+            # Check for stop conditions during warmup
             if stop_requested or emergency_stop_requested:
-                print("Print stopped by user")
-                break
-
-            if remaining <= 0:
-                print("\nPrint time expired. Starting slow cool down.")
+                print("Warmup stopped by user")
                 break
 
             # Read temperatures
@@ -432,11 +444,12 @@ def main_loop():
             sensor_data = get_sensor_temps()
 
             if avg_temp is None:
-                print("ERROR: Temperature sensor failure during operation!")
+                print("ERROR: Temperature sensor failure during warmup!")
                 time.sleep(TEMP_UPDATE_INTERVAL)
                 continue
 
             # Update temperature history
+            current_time = time.time()
             with history_lock:
                 temp_history.append({
                     'time': current_time,
@@ -446,45 +459,80 @@ def main_loop():
                 if len(temp_history) > MAX_HISTORY:
                     temp_history.pop(0)
 
-            # Log data if enabled
-            if logging_enabled:
-                log_data.append([
-                    datetime.now().isoformat(),
-                    f"{elapsed:.1f}",
-                    f"{avg_temp:.2f}",
-                    f"{pid.setpoint:.2f}",
-                    'ON' if heater_on else 'OFF',
-                    'ON' if fans_on else 'OFF',
-                    status_data['phase']
-                ])
-
-            # Calculate ETA and phase
+            # Calculate ETA
             eta = calculate_eta(avg_temp, pid.setpoint)
-            if abs(avg_temp - pid.setpoint) < 1.0:
-                status_data['phase'] = 'maintaining'
-            else:
-                status_data['phase'] = 'heating'
 
-            # Update status
+            # Update status (show full print time since timer hasn't started)
             status_data['current_temp'] = avg_temp
             status_data['sensor_temps'] = [
                 {'id': sid, 'name': name, 'temp': temp}
                 for sid, name, temp in sensor_data
             ]
             status_data['setpoint'] = pid.setpoint
-            status_data['time_remaining'] = remaining
-            status_data['print_time_remaining'] = remaining
+            status_data['print_time_remaining'] = print_duration_seconds
             status_data['eta_to_target'] = eta
             status_data['heater_on'] = heater_on
             status_data['fans_on'] = fans_on
-            status_data['heater_manual'] = heater_manual_override
-            status_data['fans_manual'] = fans_manual_override
 
-            print(f"Temp: {avg_temp:.1f}°C | Target: {pid.setpoint:.1f}°C | Remaining: {remaining/60:.1f}min | ETA: {eta}s")
+            print(f"Warming up: {avg_temp:.1f}°C | Target: {pid.setpoint:.1f}°C | ETA: {eta}s")
 
-            # PID control (unless manual override or emergency)
+            # Check if target temp reached (within 1°C)
+            if abs(avg_temp - pid.setpoint) < 1.0:
+                warmup_complete = True
+                print(f"\nTarget temperature reached: {avg_temp:.1f}°C")
+
+                if require_confirmation:
+                    # Wait for user confirmation
+                    print("Waiting for user confirmation to start print...")
+                    with state_lock:
+                        awaiting_preheat_confirmation = True
+                        status_data['awaiting_preheat_confirmation'] = True
+
+                    # Keep maintaining temperature while waiting for confirmation
+                    while awaiting_preheat_confirmation and print_active and not shutdown_requested:
+                        # Check for stop/emergency stop
+                        if stop_requested or emergency_stop_requested:
+                            print("Print stopped before confirmation")
+                            break
+
+                        # Check if user confirmed
+                        if preheat_confirmed:
+                            with state_lock:
+                                awaiting_preheat_confirmation = False
+                                status_data['awaiting_preheat_confirmation'] = False
+                            print("Preheat confirmed by user. Starting print timer.")
+                            break
+
+                        # Continue PID control to maintain temp
+                        avg_temp = get_average_temp()
+                        if avg_temp is not None:
+                            pid.setpoint = desired_temp
+                            control = pid(avg_temp)
+
+                            # Heater control
+                            hysteresis = current_settings.get('hysteresis', HYSTERESIS)
+                            if not heater_manual_override and not emergency_stop:
+                                if not heater_on and avg_temp < (pid.setpoint - hysteresis):
+                                    heater_on = True
+                                    GPIO.output(RELAY_PIN, GPIO.HIGH)
+                                    status_data['heater_on'] = True
+                                elif heater_on and avg_temp > (pid.setpoint + hysteresis):
+                                    heater_on = False
+                                    GPIO.output(RELAY_PIN, GPIO.LOW)
+                                    status_data['heater_on'] = False
+
+                            # Update status
+                            status_data['current_temp'] = avg_temp
+                            status_data['print_time_remaining'] = print_duration_seconds
+
+                        time.sleep(TEMP_UPDATE_INTERVAL)
+
+                # Break from warmup loop (either confirmation received or auto-start)
+                break
+
+            # PID control during warmup (if not emergency)
             if not emergency_stop:
-                pid.setpoint = current_settings['desired_temp']  # Allow mid-print adjustment
+                pid.setpoint = desired_temp
                 control = pid(avg_temp)
 
                 # Heater control (using configurable hysteresis)
@@ -494,33 +542,164 @@ def main_loop():
                         heater_on = True
                         GPIO.output(RELAY_PIN, GPIO.HIGH)
                         status_data['heater_on'] = True
-                        print("Heater ON (PID)")
                     elif heater_on and avg_temp > (pid.setpoint + hysteresis):
                         heater_on = False
                         GPIO.output(RELAY_PIN, GPIO.LOW)
                         status_data['heater_on'] = False
-                        print("Heater OFF (PID)")
-
-                # Fan control (if not manual override)
-                if not fans_manual_override:
-                    if current_settings.get('fans_enabled', True) and not fans_on:
-                        fans_on = True
-                        GPIO.output(FAN1_PIN, GPIO.HIGH)
-                        GPIO.output(FAN2_PIN, GPIO.HIGH)
-                        status_data['fans_on'] = True
             else:
-                # Emergency stop - turn off heater and fans
+                # Emergency stop - turn off heater
                 if heater_on:
                     heater_on = False
                     GPIO.output(RELAY_PIN, GPIO.LOW)
                     status_data['heater_on'] = False
-                if fans_on:
-                    fans_on = False
-                    GPIO.output(FAN1_PIN, GPIO.LOW)
-                    GPIO.output(FAN2_PIN, GPIO.LOW)
-                    status_data['fans_on'] = False
 
             time.sleep(TEMP_UPDATE_INTERVAL)
+
+        # If stopped during warmup, skip to cleanup
+        if stop_requested or emergency_stop_requested or shutdown_requested:
+            # Jump to cleanup section
+            pass  # Will fall through to existing cleanup code after main loop
+        else:
+            # Warmup complete, now start the print timer
+            start_time = time.time()
+            total_paused_time = 0  # Track total time spent paused
+            pause_start_time = 0   # Track when pause started
+            status_data['phase'] = 'heating'
+
+            print(f"Starting print timer: {print_duration_seconds/60:.1f} minutes")
+
+            # Main control loop (only runs if warmup completed successfully)
+            while print_active and not shutdown_requested:
+                current_time = time.time()
+
+                # Handle pause state
+                if pause_requested:
+                    with state_lock:
+                        pause_requested = False
+                        print_paused = not print_paused
+                        status_data['print_paused'] = print_paused
+
+                        if print_paused:
+                            pause_start_time = current_time
+                            print("Print PAUSED - timer stopped, temperature control active")
+                        else:
+                            # Resuming - add this pause duration to total
+                            total_paused_time += (current_time - pause_start_time)
+                            print("Print RESUMED - timer continuing")
+
+                # Calculate elapsed time (excluding paused time)
+                if print_paused:
+                    # If currently paused, don't count time since pause started
+                    elapsed = (pause_start_time - start_time) - total_paused_time
+                else:
+                    elapsed = (current_time - start_time) - total_paused_time
+
+                with time_lock:
+                    remaining = print_duration_seconds + additional_seconds - elapsed
+
+                # Check for stop conditions
+                if stop_requested or emergency_stop_requested:
+                    print("Print stopped by user")
+                    break
+
+                if remaining <= 0 and not print_paused:
+                    print("\nPrint time expired. Starting slow cool down.")
+                    break
+
+                # Read temperatures
+                avg_temp = get_average_temp()
+                sensor_data = get_sensor_temps()
+
+                if avg_temp is None:
+                    print("ERROR: Temperature sensor failure during operation!")
+                    time.sleep(TEMP_UPDATE_INTERVAL)
+                    continue
+
+                # Update temperature history
+                with history_lock:
+                    temp_history.append({
+                        'time': current_time,
+                        'temp': avg_temp,
+                        'setpoint': pid.setpoint
+                    })
+                    if len(temp_history) > MAX_HISTORY:
+                        temp_history.pop(0)
+
+                # Log data if enabled
+                if logging_enabled:
+                    log_data.append([
+                        datetime.now().isoformat(),
+                        f"{elapsed:.1f}",
+                        f"{avg_temp:.2f}",
+                        f"{pid.setpoint:.2f}",
+                        'ON' if heater_on else 'OFF',
+                        'ON' if fans_on else 'OFF',
+                        status_data['phase']
+                    ])
+
+                # Calculate ETA and phase
+                eta = calculate_eta(avg_temp, pid.setpoint)
+                if abs(avg_temp - pid.setpoint) < 1.0:
+                    status_data['phase'] = 'maintaining'
+                else:
+                    status_data['phase'] = 'heating'
+
+                # Update status
+                status_data['current_temp'] = avg_temp
+                status_data['sensor_temps'] = [
+                    {'id': sid, 'name': name, 'temp': temp}
+                    for sid, name, temp in sensor_data
+                ]
+                status_data['setpoint'] = pid.setpoint
+                status_data['time_remaining'] = remaining
+                status_data['print_time_remaining'] = remaining
+                status_data['eta_to_target'] = eta
+                status_data['heater_on'] = heater_on
+                status_data['fans_on'] = fans_on
+                status_data['heater_manual'] = heater_manual_override
+                status_data['fans_manual'] = fans_manual_override
+
+                print(f"Temp: {avg_temp:.1f}°C | Target: {pid.setpoint:.1f}°C | Remaining: {remaining/60:.1f}min | ETA: {eta}s")
+
+                # PID control (unless manual override or emergency)
+                if not emergency_stop:
+                    pid.setpoint = current_settings['desired_temp']  # Allow mid-print adjustment
+                    control = pid(avg_temp)
+
+                    # Heater control (using configurable hysteresis)
+                    hysteresis = current_settings.get('hysteresis', HYSTERESIS)
+                    if not heater_manual_override:
+                        if not heater_on and avg_temp < (pid.setpoint - hysteresis):
+                            heater_on = True
+                            GPIO.output(RELAY_PIN, GPIO.HIGH)
+                            status_data['heater_on'] = True
+                            print("Heater ON (PID)")
+                        elif heater_on and avg_temp > (pid.setpoint + hysteresis):
+                            heater_on = False
+                            GPIO.output(RELAY_PIN, GPIO.LOW)
+                            status_data['heater_on'] = False
+                            print("Heater OFF (PID)")
+
+                    # Fan control (if not manual override)
+                    if not fans_manual_override:
+                        if current_settings.get('fans_enabled', True) and not fans_on:
+                            fans_on = True
+                            GPIO.output(FAN1_PIN, GPIO.HIGH)
+                            GPIO.output(FAN2_PIN, GPIO.HIGH)
+                            status_data['fans_on'] = True
+                else:
+                    # Emergency stop - turn off heater and fans
+                    if heater_on:
+                        heater_on = False
+                        GPIO.output(RELAY_PIN, GPIO.LOW)
+                        status_data['heater_on'] = False
+                    if fans_on:
+                        fans_on = False
+                        GPIO.output(FAN1_PIN, GPIO.LOW)
+                        GPIO.output(FAN2_PIN, GPIO.LOW)
+                        status_data['fans_on'] = False
+
+                time.sleep(TEMP_UPDATE_INTERVAL)
 
         # Print cycle ended - start cooldown (using configurable cooldown time)
         if not stop_requested and not emergency_stop_requested and not shutdown_requested:
@@ -540,8 +719,13 @@ def main_loop():
             status_data['heater_on'] = False
             status_data['fans_on'] = fans_on
             status_data['phase'] = 'idle'
+            status_data['print_time_remaining'] = 0
             stop_requested = False
             emergency_stop_requested = False
+            # Clear pause state
+            print_paused = False
+            pause_requested = False
+            status_data['print_paused'] = False
 
         print("Print cycle complete.")
 
@@ -988,6 +1172,15 @@ HTML_TEMPLATE = """
                     <input type="number" id="cooldown-hours" value="4" min="0" max="12" step="0.5">
                     <small style="display: block; margin-top: 5px; color: #666;">Duration for slow cooldown phase after print</small>
                 </div>
+
+                <div class="toggle-switch" style="margin-top: 15px;">
+                    <span>Require Preheat Confirmation</span>
+                    <label class="switch">
+                        <input type="checkbox" id="require-preheat-confirmation">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <small style="display: block; margin-top: 5px; color: #666;">Wait for user confirmation after reaching target temperature before starting print timer</small>
             </div>
 
             <div class="settings-section">
@@ -1005,6 +1198,27 @@ HTML_TEMPLATE = """
                     Cancel
                 </button>
             </div>
+        </div>
+    </div>
+
+    <!-- Preheat Confirmation Modal -->
+    <div id="preheat-modal" class="modal">
+        <div class="modal-content" style="max-width: 400px;">
+            <div class="modal-header">
+                <h2>🔥 Target Temperature Reached!</h2>
+            </div>
+
+            <p style="margin: 20px 0; font-size: 16px;">
+                The chamber has reached the target temperature and is ready for printing.
+            </p>
+
+            <p style="margin: 20px 0; font-size: 14px; color: #666;">
+                Click "START PRINT" to begin the print timer, or wait to maintain temperature.
+            </p>
+
+            <button class="button primary" onclick="confirmPreheat()" style="width: 100%; font-size: 18px; padding: 15px;">
+                ▶ START PRINT
+            </button>
         </div>
     </div>
 
@@ -1033,6 +1247,7 @@ HTML_TEMPLATE = """
             <h2>Print Controls</h2>
             <div class="button-group">
                 <button class="button primary" id="start-btn" onclick="startPrint()">▶ START</button>
+                <button class="button secondary" id="pause-btn" onclick="pausePrint()" disabled>⏸ PAUSE</button>
                 <button class="button warning" id="stop-btn" onclick="stopPrint()" disabled>■ STOP</button>
                 <button class="button danger" onclick="emergencyStop()">⚠ EMERGENCY STOP</button>
             </div>
@@ -1159,6 +1374,8 @@ HTML_TEMPLATE = """
         let notificationsEnabled = false;
         let tempUnit = 'C'; // Global temperature unit
         let sensorIds = []; // Store sensor IDs for renaming
+        let previousPauseState = false; // Track pause state for notifications
+        let previousAwaitingPreheat = false; // Track preheat confirmation state
 
         // Temperature conversion functions
         function celsiusToFahrenheit(c) {
@@ -1205,6 +1422,9 @@ HTML_TEMPLATE = """
 
             const cooldownHours = localStorage.getItem('cooldownHours') || '4';
             document.getElementById('cooldown-hours').value = cooldownHours;
+
+            const requirePreheatConfirmation = localStorage.getItem('requirePreheatConfirmation') === 'true';
+            document.getElementById('require-preheat-confirmation').checked = requirePreheatConfirmation;
 
             const savedTheme = localStorage.getItem('theme') || 'light';
             document.getElementById('dark-mode-toggle').checked = (savedTheme === 'dark');
@@ -1265,6 +1485,9 @@ HTML_TEMPLATE = """
             const cooldownHours = document.getElementById('cooldown-hours').value;
             localStorage.setItem('cooldownHours', cooldownHours);
 
+            const requirePreheatConfirmation = document.getElementById('require-preheat-confirmation').checked;
+            localStorage.setItem('requirePreheatConfirmation', requirePreheatConfirmation);
+
             // Collect probe names
             const probeNames = {};
             sensorIds.forEach(id => {
@@ -1282,6 +1505,7 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({
                         hysteresis: parseFloat(hysteresis),
                         cooldown_hours: parseFloat(cooldownHours),
+                        require_preheat_confirmation: requirePreheatConfirmation,
                         probe_names: probeNames,
                         temp_unit: tempUnit
                     })
@@ -1557,6 +1781,32 @@ HTML_TEMPLATE = """
             }
         }
 
+        async function pausePrint() {
+            try {
+                const response = await fetch('/pause', {method: 'POST'});
+                const result = await response.json();
+                if (result.success) {
+                    // Notification will be updated based on status
+                }
+            } catch (e) {
+                console.error('Failed to pause:', e);
+            }
+        }
+
+        async function confirmPreheat() {
+            try {
+                const response = await fetch('/confirm_preheat', {method: 'POST'});
+                const result = await response.json();
+                if (result.success) {
+                    // Hide the preheat modal
+                    document.getElementById('preheat-modal').style.display = 'none';
+                    showNotification('Print Started', 'Print timer has begun');
+                }
+            } catch (e) {
+                console.error('Failed to confirm preheat:', e);
+            }
+        }
+
         async function emergencyStop() {
             if (!confirm('Emergency stop will immediately halt all heating and cooling. Continue?')) {
                 return;
@@ -1697,14 +1947,39 @@ HTML_TEMPLATE = """
 
                     // Update buttons
                     const startBtn = document.getElementById('start-btn');
+                    const pauseBtn = document.getElementById('pause-btn');
                     const stopBtn = document.getElementById('stop-btn');
 
                     if (data.print_active) {
                         startBtn.disabled = true;
+                        pauseBtn.disabled = false;
                         stopBtn.disabled = false;
+
+                        // Update pause button text based on state
+                        if (data.print_paused) {
+                            pauseBtn.textContent = '▶ RESUME';
+                            pauseBtn.className = 'button primary';
+                        } else {
+                            pauseBtn.textContent = '⏸ PAUSE';
+                            pauseBtn.className = 'button secondary';
+                        }
+
+                        // Show notification when pause state changes
+                        if (data.print_paused !== previousPauseState) {
+                            if (data.print_paused) {
+                                showNotification('Print Paused', 'Timer stopped - temperature control active');
+                            } else if (previousPauseState) {
+                                showNotification('Print Resumed', 'Timer continuing');
+                            }
+                            previousPauseState = data.print_paused;
+                        }
                     } else {
                         startBtn.disabled = false;
+                        pauseBtn.disabled = true;
                         stopBtn.disabled = true;
+                        pauseBtn.textContent = '⏸ PAUSE';
+                        pauseBtn.className = 'button secondary';
+                        previousPauseState = false; // Reset when not active
                     }
 
                     // Fire alert
@@ -1728,6 +2003,23 @@ HTML_TEMPLATE = """
                         li.innerHTML = `<span>${sensor.name}</span><span>${tempText}</span>`;
                         sensorList.appendChild(li);
                     });
+
+                    // Handle preheat confirmation modal
+                    const preheatModal = document.getElementById('preheat-modal');
+                    if (data.awaiting_preheat_confirmation) {
+                        preheatModal.style.display = 'block';
+
+                        // Show notification when first entering preheat confirmation state
+                        if (!previousAwaitingPreheat) {
+                            showNotification('Target Temperature Reached!', 'Chamber is ready - confirm to start print timer');
+                            previousAwaitingPreheat = true;
+                        }
+                    } else {
+                        preheatModal.style.display = 'none';
+                        if (previousAwaitingPreheat) {
+                            previousAwaitingPreheat = false;
+                        }
+                    }
                 });
         }
 
@@ -1814,6 +2106,8 @@ def save_advanced_settings():
         current_settings['cooldown_hours'] = data['cooldown_hours']
     if 'temp_unit' in data:
         current_settings['temp_unit'] = data['temp_unit']
+    if 'require_preheat_confirmation' in data:
+        current_settings['require_preheat_confirmation'] = data['require_preheat_confirmation']
     if 'probe_names' in data:
         current_settings['probe_names'] = data['probe_names']
         # Update probe locations immediately
@@ -1866,22 +2160,47 @@ def start():
 
 @app.route('/stop', methods=['POST'])
 def stop():
-    global stop_requested
+    global stop_requested, additional_seconds
 
     if print_active:
         with state_lock:
             stop_requested = True
+            additional_seconds = 0  # Reset time adjustments when stopping
         return jsonify({'success': True, 'message': 'Print stopped'})
 
     return jsonify({'success': False, 'message': 'No print active'})
 
+@app.route('/pause', methods=['POST'])
+def pause():
+    global pause_requested
+
+    if print_active:
+        with state_lock:
+            pause_requested = True
+        message = 'Pause toggled' if not print_paused else 'Resume toggled'
+        return jsonify({'success': True, 'message': message})
+
+    return jsonify({'success': False, 'message': 'No print active'})
+
+@app.route('/confirm_preheat', methods=['POST'])
+def confirm_preheat():
+    global preheat_confirmed
+
+    if print_active and awaiting_preheat_confirmation:
+        with state_lock:
+            preheat_confirmed = True
+        return jsonify({'success': True, 'message': 'Preheat confirmed, starting print timer'})
+
+    return jsonify({'success': False, 'message': 'Not waiting for preheat confirmation'})
+
 @app.route('/emergency_stop', methods=['POST'])
 def emergency_stop_route():
-    global emergency_stop_requested, stop_requested
+    global emergency_stop_requested, stop_requested, additional_seconds
 
     with state_lock:
         emergency_stop_requested = True
         stop_requested = True
+        additional_seconds = 0  # Reset time adjustments when emergency stopping
 
     return jsonify({'success': True, 'message': 'Emergency stop activated'})
 

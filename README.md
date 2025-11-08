@@ -21,6 +21,9 @@ A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber
 - 🔒 **Remote Access** - WireGuard VPN support
 - 💾 **Preset Configs** - Save and load common settings
 - 🔄 **Auto-Start** - Runs as systemd service
+- ⏸️ **Pause/Resume** - Pause print timer while maintaining temperature
+- 🔥 **Preheat Phase** - Reaches target temp before starting print timer
+- ✅ **Preheat Confirmation** - Optional wait for user approval to start print
 
 ## Quick Start
 
@@ -130,8 +133,11 @@ sudo systemctl status x1c-heater
 Access at `http://<raspberry-pi-ip>:5000`
 
 **Control Panel:**
-- START/STOP/EMERGENCY STOP buttons
-- Manual toggles for heater, fans, and lights
+- START button - begins warming up phase
+- PAUSE/RESUME button - pause print timer while maintaining temperature
+- STOP button - gracefully stop print cycle
+- EMERGENCY STOP - immediate halt of all systems
+- Manual toggles for heater, fans, and lights (auto-cleared on START)
 - Real-time status display
 
 **Configuration:**
@@ -139,11 +145,13 @@ Access at `http://<raspberry-pi-ip>:5000`
 - Configure print duration
 - Quick time adjustments (±5min, +15min)
 - Enable/disable logging
+- Optional preheat confirmation (Settings menu)
 
 **Monitoring:**
 - Current vs target temperature
-- Phase indicator (IDLE/HEATING/MAINTAINING/COOLING)
+- Phase indicator (IDLE/WARMING UP/HEATING/MAINTAINING/COOLING)
 - ETA to target temperature
+- Print time remaining (frozen when paused)
 - Individual sensor readings
 - Real-time temperature graph
 
@@ -351,6 +359,6 @@ Contributions welcome! Please:
 
 ---
 
-**Version**: 2.0
+**Version**: 2.2
 **Status**: Production Ready
-**Last Updated**: 2025-11-07
+**Last Updated**: 2025-11-08

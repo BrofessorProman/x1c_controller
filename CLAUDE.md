@@ -15,6 +15,9 @@ This is a Raspberry Pi-based temperature controller for a 3D printer chamber hea
 - ✅ Browser notifications and CSV logging
 - ✅ Preset configurations and settings persistence
 - ✅ Git version control with GitHub integration
+- ✅ Pause/Resume functionality - pause print timer while maintaining temperature
+- ✅ Preheat phase - reaches target temperature before starting print timer
+- ✅ Optional preheat confirmation - wait for user confirmation before starting print
 
 ## Quick Start
 
@@ -113,12 +116,24 @@ Access at: `http://<raspberry-pi-ip>:5000`
 
 #### Control Panel
 - **START button**: Begin print cycle with current settings
+  - Automatically clears any manual overrides and switches heater/fans to Auto mode
+  - Begins warming up phase to reach target temperature
+- **PAUSE button**: Pause/Resume print timer
+  - Pauses the print time countdown
+  - Temperature control remains active (maintains setpoint)
+  - Fans stay on if configured
+  - Button changes to "RESUME" when paused
 - **STOP button**: Gracefully stop print cycle (skips cooldown)
+  - Resets print time adjustments
+  - Clears pause state
 - **EMERGENCY STOP**: Immediately halt all heating/cooling
+  - Resets print time adjustments
+  - Turns off heater and fans immediately
 - **Manual toggles**: Override PID control for heater, fans, and lights
   - Heater/Fan toggles show (Auto) or (Manual) status
   - Manual override allows forcing components on/off during print
   - Useful for safety or troubleshooting
+  - Manual overrides are automatically cleared when START is clicked
 
 #### Configuration
 - **Target Temperature**: Adjustable mid-print (0-100°C or 32-212°F, 0.5° increments)
@@ -140,6 +155,10 @@ Access via ⚙️ Settings button in the header.
     - Controls heater on/off cycling to prevent relay wear
   - **Cooldown Time**: Adjustable duration (default: 4 hours, range: 0-12 hours)
     - Sets length of gradual cooldown phase after print
+  - **Require Preheat Confirmation**: Wait for user confirmation before starting print timer (default: OFF)
+    - When enabled: System reaches target temp, shows confirmation modal, waits for user to click "START PRINT"
+    - When disabled: System automatically starts print timer after reaching target temp
+    - Temperature is maintained while waiting for confirmation
 - **Probe Names**:
   - **Rename Temperature Sensors**: Customize display name for each DS18B20 probe
     - Names persist and appear throughout the interface
@@ -156,10 +175,14 @@ Access via ⚙️ Settings button in the header.
 #### Status Display
 - **Current Temperature**: Average of all working sensors
 - **Target Temperature**: Current setpoint
-- **Phase**: IDLE, HEATING, MAINTAINING, or COOLING
+- **Phase**: IDLE, WARMING UP, HEATING, MAINTAINING, or COOLING
 - **ETA to Target**: Estimated time to reach target temp (based on heating rate)
 - **Print Time Remaining**: Countdown for print duration
-- **Cooldown Time Remaining**: Separate display during 4-hour cooldown
+  - Shows full configured time during WARMING UP phase (timer hasn't started yet)
+  - Counts down during HEATING/MAINTAINING phases
+  - Freezes when paused, resumes when unpaused
+  - Resets to 0 when print cycle ends
+- **Cooldown Time Remaining**: Separate display during cooldown phase
 - **Individual Sensors**: List showing each sensor reading
 
 #### Temperature Graph
@@ -173,6 +196,10 @@ Access via ⚙️ Settings button in the header.
 - Requests permission on first load
 - Notifies on:
   - Print started
+  - Print paused / resumed
+  - Target temperature reached (preheat complete)
+  - Preheat confirmation required
+  - Print timer started (after preheat confirmation)
   - Print stopped
   - Emergency stop
   - Settings saved
@@ -217,16 +244,49 @@ Four concurrent threads:
 - **Configurable hysteresis**: User-adjustable temperature band (default: 2.0°C, range: 0.5-10°C) prevents relay cycling
 - **Mid-print adjustment**: Web interface can change target temperature during operation
 - **Manual override**: User can force heater/fans on/off bypassing PID
+  - Manual overrides are automatically cleared when START button is clicked
+  - System switches back to Auto mode for new print cycle
+  - Ensures consistent behavior at start of each print
 - **Temperature units**: Display in Celsius or Fahrenheit (all calculations done in Celsius internally)
 - **ETA calculation**: Uses last 2 minutes of temperature data to estimate time to target
 
 ### Print Cycle Phases
 1. **IDLE**: Waiting for START command
-2. **HEATING**: Temperature rising to setpoint
-3. **MAINTAINING**: Within 1°C of setpoint
-4. **COOLING**: Configurable gradual cooldown to ambient (default: 4 hours, 5-minute steps)
+2. **WARMING UP**: Initial heating to target temperature before print timer starts
+   - PID control active, heater and fans operating
+   - Print time displays full configured duration (not counting down)
+   - ETA to target temperature shown
+   - When temperature reaches within 1°C of setpoint:
+     - If "Require Preheat Confirmation" is disabled: Automatically transitions to HEATING phase and starts print timer
+     - If "Require Preheat Confirmation" is enabled: Shows confirmation modal, maintains temperature, waits for user to click "START PRINT"
+   - Browser notification sent when target temperature reached
+3. **HEATING**: Print timer counting down, temperature rising toward or at setpoint
+   - Print timer started and actively counting down
+   - Temperature control maintains setpoint
+   - Can be paused (timer stops, temperature control continues)
+4. **MAINTAINING**: Print timer counting down, within 1°C of setpoint
+   - Same as HEATING but indicates stable temperature
+   - Can be paused (timer stops, temperature control continues)
+5. **COOLING**: Configurable gradual cooldown to ambient (default: 4 hours, 5-minute steps)
+   - Only runs if print completes normally (not stopped early)
+   - Gradual temperature reduction prevents thermal shock
 
 After cooldown, system returns to IDLE and waits for next START command.
+
+### Pause/Resume Functionality
+- **PAUSE button** available during HEATING and MAINTAINING phases
+- When paused:
+  - Print time countdown stops (frozen at current value)
+  - Temperature control remains fully active (PID continues)
+  - Heater and fans continue operating to maintain setpoint
+  - Button changes to "RESUME" (green color)
+  - Browser notification sent
+- When resumed:
+  - Print time countdown continues from where it stopped
+  - All other functions continue normally
+  - Button changes back to "PAUSE" (gray color)
+  - Browser notification sent
+- Pause state is cleared when print ends or is stopped
 
 ### Data Tracking
 - **Temperature history**: Last 1000 data points stored in memory
@@ -269,7 +329,9 @@ Located at top of `x1c_heater.py`:
 - `GET /get_settings` - Current settings and presets (JSON)
 
 ### Control Commands
-- `POST /start` - Start print cycle
+- `POST /start` - Start print cycle (begins WARMING UP phase)
+- `POST /pause` - Toggle pause/resume for print timer
+- `POST /confirm_preheat` - Confirm preheat complete and start print timer
 - `POST /stop` - Stop print cycle
 - `POST /emergency_stop` - Emergency halt
 - `POST /reset` - Reset fire alarm
@@ -279,7 +341,7 @@ Located at top of `x1c_heater.py`:
 
 ### Configuration
 - `POST /save_settings` - Save current configuration
-- `POST /save_advanced_settings` - Save advanced settings (hysteresis, cooldown, temp unit, probe names)
+- `POST /save_advanced_settings` - Save advanced settings (hysteresis, cooldown, temp unit, preheat confirmation, probe names)
 - `POST /save_preset` - Save new preset
 - `POST /load_preset` - Load existing preset
 - `POST /adjust_time` - Add/subtract print time
@@ -361,7 +423,7 @@ When user toggles heater/fans via web interface:
 - Loaded on startup
 - Contains:
   - Basic settings: desired_temp, print_hours, print_minutes, fans_enabled, lights_enabled, logging_enabled
-  - Advanced settings: hysteresis, cooldown_hours, temp_unit, probe_names
+  - Advanced settings: hysteresis, cooldown_hours, temp_unit, require_preheat_confirmation, probe_names
   - Presets array
 - Note: `heater_settings.json` is excluded from git (contains user-specific configuration)
 
@@ -576,13 +638,36 @@ See `TODO.md` for planned improvements including:
 
 ## Version History
 
-**Current Version**: 2.1 (Advanced Settings & Version Control)
-- **NEW**: Comprehensive settings modal with dark mode, temp units, hysteresis, cooldown, and probe renaming
-- **NEW**: Temperature unit switching (Celsius/Fahrenheit) with automatic conversion
-- **NEW**: User-configurable hysteresis (0.5-10°C) for heater control
-- **NEW**: User-configurable cooldown time (0-12 hours)
-- **NEW**: Custom probe naming for easy sensor identification
-- **NEW**: Git version control with GitHub integration (SSH)
+**Current Version**: 2.2 (Pause, Preheat & Control Improvements)
+- **NEW**: Pause/Resume functionality - pause print timer while maintaining temperature control
+- **NEW**: Warming up phase - reaches target temperature before starting print timer
+- **NEW**: Optional preheat confirmation - wait for user confirmation before starting print timer
+- **NEW**: Preheat confirmation modal with browser notification
+- **IMPROVED**: Manual overrides automatically clear when START is clicked
+- **IMPROVED**: Print time resets properly when STOP or EMERGENCY STOP is clicked
+- **IMPROVED**: Print time displays correctly reset to 0 when print cycle ends
+- Comprehensive settings modal with dark mode, temp units, hysteresis, cooldown, and probe renaming
+- Temperature unit switching (Celsius/Fahrenheit) with automatic conversion
+- User-configurable hysteresis (0.5-10°C) for heater control
+- User-configurable cooldown time (0-12 hours)
+- Custom probe naming for easy sensor identification
+- Git version control with GitHub integration (SSH)
+- Fully web-controlled interface
+- Systemd service integration
+- Remote access support
+- Real-time temperature graphing
+- Browser notifications
+- CSV logging
+- Preset management
+- Settings persistence
+
+**Version 2.1**: (Advanced Settings & Version Control)
+- Comprehensive settings modal with dark mode, temp units, hysteresis, cooldown, and probe renaming
+- Temperature unit switching (Celsius/Fahrenheit) with automatic conversion
+- User-configurable hysteresis (0.5-10°C) for heater control
+- User-configurable cooldown time (0-12 hours)
+- Custom probe naming for easy sensor identification
+- Git version control with GitHub integration (SSH)
 - Fully web-controlled interface
 - Systemd service integration
 - Remote access support
