@@ -9,6 +9,7 @@ from simple_pid import PID
 import RPi.GPIO as GPIO
 import subprocess
 from flask import Flask, render_template_string, jsonify, request, send_file
+from flask_socketio import SocketIO, emit
 import io
 import csv
 
@@ -311,6 +312,7 @@ def fire_monitor():
                     status_data['emergency_stop'] = True
                     status_data['heater_on'] = False
                     status_data['fans_on'] = False
+                emit_status_update()  # Immediate WebSocket update for fire alarm
                 print("Heater and fans turned off. Use web interface to RESET.")
 
         if emergency_stop and reset_requested:
@@ -321,6 +323,7 @@ def fire_monitor():
                     status_data['emergency_stop'] = False
                     GPIO.output(BUZZER_PIN, GPIO.LOW)
                     reset_requested = False
+                emit_status_update()  # Immediate WebSocket update for fire reset
             else:
                 print("Cannot reset: Fire still detected!")
                 reset_requested = False
@@ -465,8 +468,9 @@ def main_loop():
                     {'id': sid, 'name': name, 'temp': temp}
                     for sid, name, temp in sensor_data
                 ]
+                emit_status_update()  # Periodic WebSocket update while idle
 
-            time.sleep(5)  # Update every 5 seconds while idle
+            time.sleep(1)  # Check every 1 second for start request (faster response to START button)
 
         if shutdown_requested:
             break
@@ -512,6 +516,20 @@ def main_loop():
             GPIO.output(FAN2_PIN, GPIO.HIGH)
             status_data['fans_on'] = True
 
+        # Turn on heater immediately if temperature is below target (for instant UI feedback)
+        initial_temp = get_average_temp()
+        if initial_temp is not None and initial_temp < desired_temp and not emergency_stop and not heater_manual_override:
+            heater_on = True
+            GPIO.output(RELAY_PIN, GPIO.HIGH)
+            status_data['heater_on'] = True
+
+        # Set initial values for UI display before first emit
+        status_data['setpoint'] = desired_temp
+        status_data['print_time_remaining'] = print_duration_seconds
+
+        # Emit immediate WebSocket update so UI responds instantly to START button
+        emit_status_update()
+
         # PID Setup
         pid = PID(Kp=2.0, Ki=0.5, Kd=0.1, setpoint=desired_temp, output_limits=(-100, 100))
 
@@ -532,6 +550,7 @@ def main_loop():
         else:
             # Warming up phase - reach target temp before starting timer
             status_data['phase'] = 'warming up'
+            emit_status_update()  # WebSocket update for phase transition
             print(f"\nWarming up chamber to {desired_temp}°C...")
 
         while print_active and not shutdown_requested and not skip_warmup:
@@ -589,6 +608,7 @@ def main_loop():
                         awaiting_preheat_confirmation = True
                         status_data['awaiting_preheat_confirmation'] = True
 
+                    emit_status_update()  # Immediate WebSocket update for preheat confirmation modal
                     # Keep maintaining temperature while waiting for confirmation
                     while awaiting_preheat_confirmation and print_active and not shutdown_requested:
                         # Check for stop/emergency stop
@@ -601,6 +621,7 @@ def main_loop():
                             with state_lock:
                                 awaiting_preheat_confirmation = False
                                 status_data['awaiting_preheat_confirmation'] = False
+                            emit_status_update()  # Immediate WebSocket update for preheat confirmed
                             print("Preheat confirmed by user. Starting print timer.")
                             break
 
@@ -654,6 +675,8 @@ def main_loop():
                     GPIO.output(RELAY_PIN, GPIO.LOW)
                     status_data['heater_on'] = False
 
+            # Emit WebSocket update for real-time UI updates during warmup
+            emit_status_update()
             time.sleep(TEMP_UPDATE_INTERVAL)
 
         # If stopped during warmup, skip to cleanup
@@ -666,6 +689,7 @@ def main_loop():
             total_paused_time = 0  # Track total time spent paused
             pause_start_time = 0   # Track when pause started
             status_data['phase'] = 'heating'
+            emit_status_update()  # WebSocket update for phase transition to heating
 
             print(f"Starting print timer: {print_duration_seconds/60:.1f} minutes")
 
@@ -800,6 +824,8 @@ def main_loop():
                         GPIO.output(FAN2_PIN, GPIO.LOW)
                         status_data['fans_on'] = False
 
+                # Emit WebSocket update for real-time UI updates during print
+                emit_status_update()
                 time.sleep(TEMP_UPDATE_INTERVAL)
 
         # Print cycle ended - start cooldown (using configurable cooldown time)
@@ -828,10 +854,28 @@ def main_loop():
             pause_requested = False
             status_data['print_paused'] = False
 
+        emit_status_update()  # WebSocket update for print cleanup/completion
         print("Print cycle complete.")
 
 # Flask Web Interface
 app = Flask(__name__)
+
+# Initialize SocketIO for real-time WebSocket communication
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# WebSocket event emitters - for real-time updates to connected clients
+def emit_status_update():
+    """Emit current status to all connected clients"""
+    with state_lock:
+        socketio.emit('status_update', status_data, namespace='/')
+
+def emit_notification(title, message):
+    """Emit notification to all connected clients"""
+    socketio.emit('notification', {'title': title, 'message': message}, namespace='/')
+
+def emit_history_update(data_point):
+    """Emit new history data point to all connected clients"""
+    socketio.emit('history_update', data_point, namespace='/')
 
 # HTML template (will be quite large with all features)
 HTML_TEMPLATE = """
@@ -984,7 +1028,12 @@ HTML_TEMPLATE = """
         }
 
         .button:hover:not(:disabled) { opacity: 0.8; }
-        .button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+            background: #666 !important;
+            color: #999 !important;
+        }
 
         .button.primary { background: var(--primary-color); color: white; }
         .button.danger { background: var(--danger-color); color: white; }
@@ -1285,6 +1334,9 @@ HTML_TEMPLATE = """
             cursor: pointer;
         }
     </style>
+
+    <!-- Socket.IO Client Library for WebSocket communication -->
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
 </head>
 <body>
     <div class="header">
@@ -1568,6 +1620,10 @@ HTML_TEMPLATE = """
         let previousPauseState = false; // Track pause state for notifications
         let previousAwaitingPreheat = false; // Track preheat confirmation state
         let isFireAlarmActive = false; // Track fire alarm state to block controls
+
+        // Optimistic update lock - prevents WebSocket from overriding optimistic updates
+        let optimisticUpdateActive = false;
+        let optimisticUpdateTimer = null;
 
         // Temperature conversion functions
         function celsiusToFahrenheit(c) {
@@ -1960,6 +2016,34 @@ HTML_TEMPLATE = """
         }
 
         async function startPrint() {
+            // Lock optimistic updates to prevent WebSocket from overriding
+            lockOptimisticUpdate();
+
+            // Optimistic UI update - disable START button immediately for instant feedback
+            const startBtn = document.getElementById('start-btn');
+            const pauseBtn = document.getElementById('pause-btn');
+            const stopBtn = document.getElementById('stop-btn');
+
+            startBtn.disabled = true;
+            pauseBtn.disabled = false;
+            stopBtn.disabled = false;
+
+            // Optimistic UI updates for instant feedback
+            // Backend will turn these on and confirm via WebSocket within ~1 second
+            const fansEnabled = document.getElementById('fans-enabled').checked;
+            if (fansEnabled) {
+                document.getElementById('fans-ind').className = 'indicator on';
+                document.getElementById('fans-toggle').checked = true;
+            }
+
+            // Heater will turn on if temp is below target
+            const currentTemp = parseFloat(document.getElementById('temp').textContent);
+            const targetTemp = parseFloat(document.getElementById('target-temp').value);
+            if (!isNaN(currentTemp) && !isNaN(targetTemp) && currentTemp < targetTemp) {
+                document.getElementById('heater-ind').className = 'indicator on';
+                document.getElementById('heater-toggle').checked = true;
+            }
+
             // Save current settings first
             await saveSettings();
 
@@ -1971,10 +2055,26 @@ HTML_TEMPLATE = """
                 }
             } catch (e) {
                 console.error('Failed to start:', e);
+                // Revert optimistic update on error
+                startBtn.disabled = false;
+                pauseBtn.disabled = true;
+                stopBtn.disabled = true;
             }
         }
 
         async function stopPrint() {
+            // Lock optimistic updates to prevent WebSocket from overriding
+            lockOptimisticUpdate();
+
+            // Optimistic UI update - enable START, disable STOP/PAUSE immediately
+            const startBtn = document.getElementById('start-btn');
+            const pauseBtn = document.getElementById('pause-btn');
+            const stopBtn = document.getElementById('stop-btn');
+
+            startBtn.disabled = false;
+            pauseBtn.disabled = true;
+            stopBtn.disabled = true;
+
             try {
                 const response = await fetch('/stop', {method: 'POST'});
                 const result = await response.json();
@@ -1983,18 +2083,47 @@ HTML_TEMPLATE = """
                 }
             } catch (e) {
                 console.error('Failed to stop:', e);
+                // Revert optimistic update on error
+                startBtn.disabled = true;
+                pauseBtn.disabled = false;
+                stopBtn.disabled = false;
             }
         }
 
         async function pausePrint() {
+            // Lock optimistic updates to prevent WebSocket from overriding
+            lockOptimisticUpdate();
+
+            // Optimistic UI update - toggle pause button appearance immediately
+            const pauseBtn = document.getElementById('pause-btn');
+            const wasPaused = pauseBtn.textContent.includes('RESUME');
+
+            if (wasPaused) {
+                // Currently paused, switching to resume
+                pauseBtn.textContent = '⏸ PAUSE';
+                pauseBtn.className = 'button secondary';
+            } else {
+                // Currently running, switching to pause
+                pauseBtn.textContent = '▶ RESUME';
+                pauseBtn.className = 'button primary';
+            }
+
             try {
                 const response = await fetch('/pause', {method: 'POST'});
                 const result = await response.json();
                 if (result.success) {
-                    // Notification will be updated based on status
+                    // Notification will be updated based on status via WebSocket
                 }
             } catch (e) {
                 console.error('Failed to pause:', e);
+                // Revert optimistic update on error
+                if (wasPaused) {
+                    pauseBtn.textContent = '▶ RESUME';
+                    pauseBtn.className = 'button primary';
+                } else {
+                    pauseBtn.textContent = '⏸ PAUSE';
+                    pauseBtn.className = 'button secondary';
+                }
             }
         }
 
@@ -2038,6 +2167,11 @@ HTML_TEMPLATE = """
             }
 
             const state = document.getElementById('heater-toggle').checked;
+
+            // Optimistic UI update - update indicator immediately
+            const indicator = document.getElementById('heater-ind');
+            indicator.className = 'indicator ' + (state ? 'on' : 'off');
+
             try {
                 const response = await fetch('/toggle_heater', {
                     method: 'POST',
@@ -2046,6 +2180,9 @@ HTML_TEMPLATE = """
                 });
             } catch (e) {
                 console.error('Failed to toggle heater:', e);
+                // Revert on error
+                indicator.className = 'indicator ' + (state ? 'off' : 'on');
+                document.getElementById('heater-toggle').checked = !state;
             }
         }
 
@@ -2059,6 +2196,11 @@ HTML_TEMPLATE = """
             }
 
             const state = document.getElementById('fans-toggle').checked;
+
+            // Optimistic UI update - update indicator immediately
+            const indicator = document.getElementById('fans-ind');
+            indicator.className = 'indicator ' + (state ? 'on' : 'off');
+
             try {
                 const response = await fetch('/toggle_fans', {
                     method: 'POST',
@@ -2067,6 +2209,9 @@ HTML_TEMPLATE = """
                 });
             } catch (e) {
                 console.error('Failed to toggle fans:', e);
+                // Revert on error
+                indicator.className = 'indicator ' + (state ? 'off' : 'on');
+                document.getElementById('fans-toggle').checked = !state;
             }
         }
 
@@ -2080,6 +2225,11 @@ HTML_TEMPLATE = """
             }
 
             const state = document.getElementById('lights-toggle').checked;
+
+            // Optimistic UI update - update indicator immediately
+            const indicator = document.getElementById('lights-ind');
+            indicator.className = 'indicator ' + (state ? 'on' : 'off');
+
             try {
                 const response = await fetch('/toggle_lights', {
                     method: 'POST',
@@ -2088,6 +2238,9 @@ HTML_TEMPLATE = """
                 });
             } catch (e) {
                 console.error('Failed to toggle lights:', e);
+                // Revert on error
+                indicator.className = 'indicator ' + (state ? 'off' : 'on');
+                document.getElementById('lights-toggle').checked = !state;
             }
         }
 
@@ -2182,6 +2335,22 @@ HTML_TEMPLATE = """
             } else {
                 return `${secs}s`;
             }
+        }
+
+        // Enable optimistic update lock to prevent WebSocket from overriding for 2 seconds
+        function lockOptimisticUpdate() {
+            optimisticUpdateActive = true;
+
+            // Clear existing timer if any
+            if (optimisticUpdateTimer) {
+                clearTimeout(optimisticUpdateTimer);
+            }
+
+            // Auto-clear after 2 seconds (backend should have processed by then)
+            optimisticUpdateTimer = setTimeout(() => {
+                optimisticUpdateActive = false;
+                optimisticUpdateTimer = null;
+            }, 2000);
         }
 
         function updateStatus() {
@@ -2398,12 +2567,227 @@ HTML_TEMPLATE = """
 
         initChart();
         loadSettings();
-        updateStatus();
-        updateHistory();
 
-        // Update every 2 seconds
-        setInterval(updateStatus, 2000);
+        // Initialize Socket.IO connection for real-time updates
+        const socket = io();
+
+        // Connection status handlers
+        socket.on('connect', () => {
+            console.log('WebSocket connected - real-time updates active');
+            // Initial data fetch on connection
+            updateStatus();
+            updateHistory();
+        });
+
+        socket.on('disconnect', () => {
+            console.log('WebSocket disconnected - attempting to reconnect...');
+        });
+
+        // Real-time status updates via WebSocket
+        socket.on('status_update', (data) => {
+            // Always update temperature displays (not affected by optimistic lock)
+            document.getElementById('temp').textContent = formatTemp(data.current_temp);
+            document.getElementById('setpoint').textContent = formatTemp(data.setpoint);
+            document.getElementById('phase').textContent = data.phase.toUpperCase();
+            document.getElementById('eta').textContent = data.eta_to_target > 0 ?
+                formatTime(data.eta_to_target) : '--';
+
+            document.getElementById('print-time').textContent = formatTime(data.print_time_remaining);
+            document.getElementById('cooldown-time').textContent = formatTime(data.cooldown_time_remaining);
+
+            // Skip button/toggle updates if optimistic update is active (prevents flickering)
+            if (!optimisticUpdateActive) {
+                // Update indicators
+                document.getElementById('heater-ind').className = 'indicator ' + (data.heater_on ? 'on' : 'off');
+                document.getElementById('fans-ind').className = 'indicator ' + (data.fans_on ? 'on' : 'off');
+                document.getElementById('lights-ind').className = 'indicator ' + (data.lights_on ? 'on' : 'off');
+
+                // Update toggle states
+                document.getElementById('heater-toggle').checked = data.heater_on;
+                document.getElementById('fans-toggle').checked = data.fans_on;
+                document.getElementById('lights-toggle').checked = data.lights_on;
+            }
+
+            // Update status text
+            document.getElementById('heater-status').textContent = data.heater_manual ? '(Manual)' : '(Auto)';
+            document.getElementById('fans-status').textContent = data.fans_manual ? '(Manual)' : '(Auto)';
+
+            // Skip button updates if optimistic update is active (prevents flickering)
+            if (!optimisticUpdateActive) {
+                // Update buttons
+                const startBtn = document.getElementById('start-btn');
+                const pauseBtn = document.getElementById('pause-btn');
+                const stopBtn = document.getElementById('stop-btn');
+
+                if (data.print_active) {
+                    startBtn.disabled = true;
+                    pauseBtn.disabled = false;
+                    stopBtn.disabled = false;
+
+                    // Update pause button text based on state
+                    if (data.print_paused) {
+                        pauseBtn.textContent = '▶ RESUME';
+                        pauseBtn.className = 'button primary';
+                    } else {
+                        pauseBtn.textContent = '⏸ PAUSE';
+                        pauseBtn.className = 'button secondary';
+                    }
+
+                    // Show notification when pause state changes
+                    if (data.print_paused !== previousPauseState) {
+                        if (data.print_paused) {
+                            showNotification('Print Paused', 'Timer stopped - temperature control active');
+                        } else if (previousPauseState) {
+                            showNotification('Print Resumed', 'Timer continuing');
+                        }
+                        previousPauseState = data.print_paused;
+                    }
+                } else {
+                    startBtn.disabled = false;
+                    pauseBtn.disabled = true;
+                    stopBtn.disabled = true;
+                    pauseBtn.textContent = '⏸ PAUSE';
+                    pauseBtn.className = 'button secondary';
+                    previousPauseState = false; // Reset when not active
+                }
+            }
+
+            // Fire alert
+            const alert = document.getElementById('fire-alert');
+            const resetBtn = document.getElementById('reset-btn');
+            const emergencyStopBtn = document.getElementById('emergency-stop-btn');
+            const heaterToggle = document.getElementById('heater-toggle');
+            const fansToggle = document.getElementById('fans-toggle');
+            const lightsToggle = document.getElementById('lights-toggle');
+            const settingsBtn = document.getElementById('settings-btn');
+
+            if (data.emergency_stop) {
+                isFireAlarmActive = true; // Set global flag
+                alert.style.display = 'block';
+                resetBtn.disabled = false;
+
+                // Disable ALL controls except reset button during fire alarm
+                startBtn.disabled = true;
+                pauseBtn.disabled = true;
+                stopBtn.disabled = true;
+                emergencyStopBtn.disabled = true;
+                settingsBtn.disabled = true;
+                heaterToggle.disabled = true;
+                fansToggle.disabled = true;
+                lightsToggle.disabled = true;
+
+                // Disable configuration inputs
+                document.getElementById('target-temp').disabled = true;
+                document.getElementById('print-hours').disabled = true;
+                document.getElementById('print-minutes').disabled = true;
+                document.getElementById('fans-enabled').disabled = true;
+                document.getElementById('logging-enabled').disabled = true;
+
+                // Disable time adjustment buttons
+                const timeAdjustButtons = document.querySelectorAll('.time-adjust button');
+                timeAdjustButtons.forEach(btn => {
+                    btn.disabled = true;
+                    btn.style.opacity = '0.4';
+                });
+
+                // Disable preset buttons
+                const presetItems = document.querySelectorAll('.preset-item');
+                presetItems.forEach(item => {
+                    item.style.pointerEvents = 'none';
+                    item.style.opacity = '0.4';
+                });
+
+                // Add visual indication that controls are locked
+                startBtn.style.opacity = '0.4';
+                pauseBtn.style.opacity = '0.4';
+                stopBtn.style.opacity = '0.4';
+                emergencyStopBtn.style.opacity = '0.4';
+            } else {
+                isFireAlarmActive = false; // Clear global flag
+                alert.style.display = 'none';
+                resetBtn.disabled = true;
+
+                // Re-enable controls when fire alarm is cleared
+                emergencyStopBtn.disabled = false;
+                settingsBtn.disabled = false;
+                heaterToggle.disabled = false;
+                fansToggle.disabled = false;
+                lightsToggle.disabled = false;
+
+                // Re-enable configuration inputs
+                document.getElementById('target-temp').disabled = false;
+                document.getElementById('print-hours').disabled = false;
+                document.getElementById('print-minutes').disabled = false;
+                document.getElementById('fans-enabled').disabled = false;
+                document.getElementById('logging-enabled').disabled = false;
+
+                // Re-enable time adjustment buttons
+                const timeAdjustButtons = document.querySelectorAll('.time-adjust button');
+                timeAdjustButtons.forEach(btn => {
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                });
+
+                // Re-enable preset buttons
+                const presetItems = document.querySelectorAll('.preset-item');
+                presetItems.forEach(item => {
+                    item.style.pointerEvents = 'auto';
+                    item.style.opacity = '1';
+                });
+
+                // Restore normal opacity
+                startBtn.style.opacity = '1';
+                pauseBtn.style.opacity = '1';
+                stopBtn.style.opacity = '1';
+                emergencyStopBtn.style.opacity = '1';
+
+                // START, PAUSE, STOP buttons already handled by print_active logic above
+            }
+
+            // Update sensor list with proper temperature formatting
+            const sensorList = document.getElementById('sensor-list');
+            sensorList.innerHTML = '';
+            data.sensor_temps.forEach(sensor => {
+                const li = document.createElement('li');
+                const tempText = sensor.temp !== null ?
+                    formatTemp(sensor.temp) : 'ERROR';
+                li.innerHTML = `<span>${sensor.name}</span><span>${tempText}</span>`;
+                sensorList.appendChild(li);
+            });
+
+            // Handle preheat confirmation modal
+            const preheatModal = document.getElementById('preheat-modal');
+            if (data.awaiting_preheat_confirmation) {
+                preheatModal.style.display = 'block';
+
+                // Show notification when first entering preheat confirmation state
+                if (!previousAwaitingPreheat) {
+                    showNotification('Target Temperature Reached!', 'Chamber is ready - confirm to start print timer');
+                    previousAwaitingPreheat = true;
+                }
+            } else {
+                preheatModal.style.display = 'none';
+                if (previousAwaitingPreheat) {
+                    previousAwaitingPreheat = false;
+                }
+            }
+        });
+
+        // Real-time notification events
+        socket.on('notification', (data) => {
+            showNotification(data.title, data.message);
+        });
+
+        // Update temperature graph every 5 seconds (WebSocket doesn't handle history data)
         setInterval(updateHistory, 5000);
+
+        // Fallback: Poll /status every 10 seconds in case WebSocket disconnects
+        setInterval(() => {
+            if (!socket.connected) {
+                console.log('WebSocket disconnected - using fallback polling');
+                updateStatus();
+            }
+        }, 10000);
     </script>
 </body>
 </html>
@@ -2569,6 +2953,7 @@ def toggle_heater():
         status_data['heater_on'] = state
         status_data['heater_manual'] = True
 
+    emit_status_update()  # Immediate WebSocket update for manual heater control
     return jsonify({'success': True})
 
 @app.route('/toggle_fans', methods=['POST'])
@@ -2585,6 +2970,7 @@ def toggle_fans():
         status_data['fans_on'] = state
         status_data['fans_manual'] = True
 
+    emit_status_update()  # Immediate WebSocket update for manual fan control
     return jsonify({'success': True})
 
 @app.route('/toggle_lights', methods=['POST'])
@@ -2600,6 +2986,7 @@ def toggle_lights():
         current_settings['lights_enabled'] = state
         save_settings(current_settings)
 
+    emit_status_update()  # Immediate WebSocket update for lights control
     return jsonify({'success': True})
 
 @app.route('/adjust_time', methods=['POST'])
@@ -2647,7 +3034,8 @@ def download_log():
     )
 
 def run_flask():
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    # Use socketio.run() instead of app.run() for WebSocket support
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
 
 # Start monitoring threads
 fire_thread = threading.Thread(target=fire_monitor, daemon=True)

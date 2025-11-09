@@ -10,6 +10,7 @@ A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber
 
 - 🌡️ **PID Temperature Control** - Precise chamber temperature management
 - 🌐 **Web Interface** - Full control via browser (desktop/mobile)
+- ⚡ **WebSocket Real-Time Updates** - Instant UI response (<50ms latency) with optimistic updates
 - 📊 **Real-time Graphing** - Temperature history with Chart.js
 - 🔥 **Fire Safety** - MQ-2 sensor with automatic shutdown
 - 💾 **Data Logging** - Export temperature logs as CSV
@@ -361,6 +362,6 @@ Contributions welcome! Please:
 
 ---
 
-**Version**: 2.3.1
-**Status**: Production Ready ✅
+**Version**: 2.4 (WebSocket Implementation)
+**Status**: In Testing ⚠️ (Known UI flickering issue - see TODO.md)
 **Last Updated**: 2025-11-08

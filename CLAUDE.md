@@ -641,7 +641,37 @@ See `TODO.md` for planned improvements including:
 
 ## Version History
 
-**Current Version**: 2.3.1 (Bug Fix - Temperature Sensor Display)
+**Current Version**: 2.4 (WebSocket Real-Time Communication - In Progress)
+- **NEW**: Real-time WebSocket communication replaces HTTP polling
+  - Migrated from 2-second polling to instant WebSocket push updates
+  - Server-to-browser latency reduced from 0-2000ms to <50ms
+  - Uses Flask-SocketIO and Socket.IO client library
+  - Auto-reconnect with fallback polling if WebSocket fails
+- **NEW**: Optimistic UI updates for instant button/toggle feedback
+  - START/STOP/PAUSE buttons update immediately on click
+  - Heater/Fans/Lights indicators update instantly
+  - 2-second optimistic lock prevents WebSocket from overriding user actions
+  - Error handling reverts changes on failure
+- **IMPROVED**: Faster idle loop response (1 second vs 5 seconds)
+  - Reduces max delay from clicking START to processing from 5s to 1s
+  - More responsive to user actions
+- **IMPROVED**: Temperature graph updates restored (5-second polling)
+  - Fixed after WebSocket migration removed original polling interval
+- **IMPROVED**: Enhanced disabled button styling
+  - 40% opacity with gray background (#666) and text (#999)
+  - Much clearer visual indication when buttons are disabled
+- **IMPROVED**: Heater activates immediately when START clicked
+  - Backend turns heater on before first WebSocket emit
+  - Reduces perceived delay in UI feedback
+- **KNOWN ISSUE**: UI flickering on button clicks (High Priority)
+  - Buttons and toggles flicker when clicked despite optimistic lock
+  - Optimistic updates being overridden by stale WebSocket data
+  - Investigating root cause for next session (see TODO.md)
+- **KNOWN ISSUE**: STOP button doesn't immediately update heater/fans indicators
+  - Missing optimistic update in stopPrint() function
+- All features from version 2.3.1 and earlier
+
+**Version 2.3.1**: (Bug Fix - Temperature Sensor Display)
 - **NEW**: Skip Preheat setting - option to bypass warming up phase and start timer immediately
 - **NEW**: Cooldown Target Temperature setting - user-configurable target temp for cooldown phase (default 21°C/70°F)
   - Replaces unreliable startup-based ambient temperature detection
