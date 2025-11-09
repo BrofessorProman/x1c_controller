@@ -456,10 +456,11 @@ When user toggles heater/fans via web interface:
 
 ### Performance
 - Temperature updates: Every 5 seconds
-- Status polling: Every 2 seconds (web interface)
+- WebSocket status updates: Real-time push (replaces HTTP polling)
 - History updates: Every 5 seconds (web interface)
 - Fire monitoring: Every 1 second
 - Cooldown steps: Every 5 minutes
+- Optimistic UI lock duration: 6 seconds (prevents stale WebSocket data from overriding user actions)
 
 ## Version Control
 
@@ -641,16 +642,26 @@ See `TODO.md` for planned improvements including:
 
 ## Version History
 
-**Current Version**: 2.4 (WebSocket Real-Time Communication - In Progress)
+**Current Version**: 2.5 (WebSocket Real-Time Communication & UI Polish)
 - **NEW**: Real-time WebSocket communication replaces HTTP polling
   - Migrated from 2-second polling to instant WebSocket push updates
   - Server-to-browser latency reduced from 0-2000ms to <50ms
   - Uses Flask-SocketIO and Socket.IO client library
   - Auto-reconnect with fallback polling if WebSocket fails
-- **NEW**: Optimistic UI updates for instant button/toggle feedback
-  - START/STOP/PAUSE buttons update immediately on click
+- **NEW**: Advanced anti-flicker system with two-layer protection
+  - Layer 1: Message sequence numbering - backend assigns incrementing IDs to each WebSocket message
+  - Layer 2: Extended optimistic lock (6 seconds) prevents stale data from overriding user actions
+  - Frontend validates sequence numbers and drops stale messages permanently
+  - Eliminates UI flickering when clicking buttons or toggling controls
+- **NEW**: Visual processing indicators for all action buttons
+  - Animated spinner appears on button being clicked (START/STOP/PAUSE/EMERGENCY STOP)
+  - Conflicting buttons temporarily dimmed and disabled during processing (6-second window)
+  - Prevents race conditions - user cannot click conflicting actions too quickly
+  - Clear visual feedback that action is being processed
+- **NEW**: Optimistic UI updates for instant feedback
+  - START/STOP/PAUSE/EMERGENCY STOP buttons update immediately on click
   - Heater/Fans/Lights indicators update instantly
-  - 2-second optimistic lock prevents WebSocket from overriding user actions
+  - All buttons have optimistic updates for consistent UX
   - Error handling reverts changes on failure
 - **IMPROVED**: Faster idle loop response (1 second vs 5 seconds)
   - Reduces max delay from clicking START to processing from 5s to 1s
@@ -663,12 +674,14 @@ See `TODO.md` for planned improvements including:
 - **IMPROVED**: Heater activates immediately when START clicked
   - Backend turns heater on before first WebSocket emit
   - Reduces perceived delay in UI feedback
-- **KNOWN ISSUE**: UI flickering on button clicks (High Priority)
-  - Buttons and toggles flicker when clicked despite optimistic lock
-  - Optimistic updates being overridden by stale WebSocket data
-  - Investigating root cause for next session (see TODO.md)
-- **KNOWN ISSUE**: STOP button doesn't immediately update heater/fans indicators
-  - Missing optimistic update in stopPrint() function
+- **FIXED**: JavaScript scoping bug in WebSocket handler
+  - Button references were scoped incorrectly, causing ReferenceError
+  - Error prevented entire WebSocket handler from completing
+  - Fixed by moving element references to top of handler function
+- **FIXED**: UI flickering completely eliminated
+  - Root cause: stale WebSocket messages from idle loop arriving after user clicks
+  - Solution: message sequence validation drops any out-of-order updates
+  - Optimistic lock extended to 6 seconds to cover backend processing time
 - All features from version 2.3.1 and earlier
 
 **Version 2.3.1**: (Bug Fix - Temperature Sensor Display)

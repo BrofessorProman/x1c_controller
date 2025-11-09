@@ -2,64 +2,50 @@
 
 ## 🐛 Active Bugs
 
-### UI Flickering with WebSocket Optimistic Updates
+*No active bugs at this time!*
+
+---
+
+## ✅ Resolved Bugs
+
+### ✅ RESOLVED: UI Flickering with WebSocket Optimistic Updates
 **Priority:** High
-**Status:** In Progress (2025-11-08)
+**Status:** Fixed (2025-11-09)
 **Discovered:** 2025-11-08
 
 **Symptoms:**
-- Clicking START/STOP/PAUSE buttons causes flickering: buttons toggle enabled/disabled/enabled
-- The delay between state changes is ~2 seconds (longer than before optimistic lock)
-- Clicking STOP button doesn't immediately turn off heater/fans toggle indicators
-- Temperature display and graph work correctly
+- Clicking START/STOP/PAUSE buttons caused flickering: buttons toggled enabled/disabled/enabled
+- Clicking STOP button didn't immediately turn off heater/fans toggle indicators
 
-**Root Cause Analysis:**
-- **CRITICAL ERROR FOUND:** JavaScript error in WebSocket handler: `Uncaught ReferenceError: startBtn is not defined`
-  - Error occurs at (index):1859:17 inside WebSocket event handler
-  - Error happens inside `socket.on('status_update')` callback
-  - This error prevents WebSocket handler from completing, leaving UI in inconsistent state
-  - **This is likely the PRIMARY cause of flickering!**
-- Optimistic UI updates occur instantly when user clicks button
-- Flask route sets flag (`start_requested = True`) but doesn't update `status_data`
-- Idle loop (sleeping for 1 second) emits WebSocket with OLD state during optimistic lock period
-- WebSocket handler throws error trying to access `startBtn` before it's defined
-- Error prevents proper state updates, causing UI inconsistency
-- Result: Multiple state changes create flickering effect
+**Root Cause:**
+1. **JavaScript scoping bug:** `startBtn` was declared inside `if (!optimisticUpdateActive)` block but accessed outside it by fire alarm code
+2. **Stale WebSocket messages:** Idle loop emitted status updates with old data before backend processed user action
+3. **Timing issue:** 2-second optimistic lock expired before fresh WebSocket data arrived (~5 seconds)
 
-**Attempted Solutions:**
-1. ✅ Added `lockOptimisticUpdate()` function with 2-second timer
-2. ✅ WebSocket handler checks `optimisticUpdateActive` flag before updating buttons/toggles
-3. ✅ Reduced idle loop sleep from 5 seconds to 1 second
-4. ✅ Backend turns heater on immediately when START is processed
-5. ❌ Still experiencing flickering despite lock mechanism
+**Solutions Implemented:**
+1. ✅ **Fixed JavaScript scoping bug**
+   - Moved button variable declarations to top of WebSocket handler
+   - Prevents ReferenceError that was breaking WebSocket handler
+2. ✅ **Implemented two-layer anti-flicker system**
+   - Layer 1: Message sequence numbering - backend assigns incrementing IDs, frontend drops stale messages
+   - Layer 2: Extended optimistic lock from 2s to 6s to cover backend processing time
+3. ✅ **Added visual processing indicators**
+   - Animated spinner on clicked button (START/STOP/PAUSE/EMERGENCY STOP)
+   - Conflicting buttons temporarily dimmed and disabled during 6-second processing window
+   - Prevents race conditions from rapid button clicks
+4. ✅ **Added optimistic updates to all action buttons**
+   - STOP and EMERGENCY STOP now immediately update heater/fans indicators
+   - Consistent instant feedback across all buttons
 
-**Potential Solutions to Try:**
-1. **PRIORITY FIX:** Find where `startBtn` is being accessed before definition (line ~1859)
-   - Move button variable declarations OUTSIDE the `if (!optimisticUpdateActive)` block
-   - Declare `startBtn`, `pauseBtn`, `stopBtn` at top of WebSocket handler
-   - Only the actual assignments should be inside the optimistic lock check
-2. Add error handling/try-catch around WebSocket button updates
-3. Increase optimistic lock duration from 2 seconds to 3-4 seconds
-4. Stop idle loop from emitting during optimistic lock period
-5. Have Flask routes immediately update `status_data` AND emit WebSocket (instead of just setting flag)
-6. Add debouncing to WebSocket updates
+**Files Modified:**
+- `x1c_heater.py` - WebSocket handler, optimistic lock, processing indicators
 
-**Code Locations:**
-- Optimistic lock: `x1c_heater.py` lines 1624-1626, 2331-2345
-- Lock usage in buttons: lines 2020, 2067, 2095
-- WebSocket handler with lock check: lines 2598-2609, 2615-2653
-- **ERROR LINE:** ~line 1859 (from browser error - need to find actual line in x1c_heater.py)
-- Idle loop emissions: line 471
-
-**Debugging Steps for Next Session:**
-1. Open browser console (F12) and note exact error line number
-2. Search x1c_heater.py for where HTML_TEMPLATE starts (around line 855)
-3. Count lines from HTML start to find line 1859 in browser = line X in Python file
-4. Check if `startBtn` is used before `const startBtn = document.getElementById('start-btn')`
-5. Look for button variables being accessed outside their scope
-
-**Related Issue:**
-- STOP button should immediately turn off heater/fans indicators (add optimistic update to stopPrint())
+**Verification:**
+- No flickering when clicking buttons
+- All buttons provide instant visual feedback
+- Console logs show stale messages being dropped
+- Processing spinners appear on button clicks
+- Conflicting buttons properly disabled during processing
 
 ---
 
@@ -284,14 +270,7 @@ Users will need to save settings once to populate new fields:
 
 ### Known Issues ⚠️
 
-1. **UI Flickering** (High Priority)
-   - Buttons and toggles flicker when clicked despite optimistic lock
-   - See "Active Bugs" section above for details
-   - Needs investigation in next session
-
-2. **STOP Button Toggles**
-   - STOP button doesn't immediately turn off heater/fans indicators
-   - Should add optimistic update to stopPrint() function
+*All known issues resolved! See "Resolved Bugs" section above.*
 
 ### Files Modified
 - `requirements.txt` - Added flask-socketio and python-socketio
@@ -334,4 +313,98 @@ sudo systemctl restart x1c-heater
 
 ---
 
-**Last Updated:** 2025-11-08
+## 📝 Flickering Fix & UI Polish Session (2025-11-09)
+
+### Changes Implemented ✅
+
+1. **Fixed JavaScript Scoping Bug**
+   - Root cause: `startBtn`, `pauseBtn`, `stopBtn` declared inside optimistic lock check
+   - Fire alarm code tried to access these variables, causing ReferenceError
+   - Solution: Moved button declarations to top of WebSocket handler
+   - Error was preventing entire WebSocket handler from completing
+
+2. **Two-Layer Anti-Flicker System**
+   - **Layer 1: Message Sequence Numbering**
+     - Backend assigns incrementing sequence number to each WebSocket emission
+     - Frontend tracks last received sequence number
+     - Stale messages (older sequence) are immediately dropped
+     - Prevents queued messages from overriding newer state
+   - **Layer 2: Extended Optimistic Lock**
+     - Increased from 2 seconds to 6 seconds
+     - Covers backend processing time (idle loop checks every 1s, processing takes ~1-2s)
+     - Lock prevents WebSocket from overriding user's optimistic updates
+     - Automatically clears after 6 seconds
+
+3. **Visual Processing Indicators**
+   - Added animated spinner to clicked button (CSS keyframe animation)
+   - Spinner appears on right side of button text
+   - `.processing` class: shows spinner, prevents interaction
+   - `.processing-blocked` class: dims conflicting buttons (50% opacity), disables interaction
+   - Conflicting buttons blocked during 6-second processing window:
+     - START clicked → STOP/PAUSE blocked
+     - STOP clicked → START/PAUSE blocked
+     - PAUSE clicked → START/STOP blocked
+     - EMERGENCY STOP clicked → all others blocked
+
+4. **Enhanced lockOptimisticUpdate() Function**
+   - Now accepts `activeButton` and `blockedButtons` parameters
+   - Automatically manages processing indicators and conflict prevention
+   - Cleans up all classes when lock expires
+   - Prevents race conditions from rapid button clicks
+
+5. **Optimistic Updates for All Action Buttons**
+   - START button: already had optimistic updates
+   - STOP button: added heater/fans OFF optimistic updates
+   - PAUSE button: already had text/class toggle
+   - EMERGENCY STOP: added button states + heater/fans OFF updates
+   - All buttons now provide consistent instant feedback
+
+6. **Console Logging for Debugging**
+   - Added sequence validation logging: "ACCEPTED" vs "DROPPED stale message"
+   - Added lock status logging: "ENABLED" and "EXPIRED"
+   - Added WebSocket update logging: "Updating indicators" vs "SKIPPED"
+   - Helps verify anti-flicker system is working correctly
+
+### Root Cause Summary
+
+The flickering was caused by three issues working together:
+1. JavaScript error breaking WebSocket handler
+2. Stale WebSocket messages from idle loop arriving after user click
+3. Optimistic lock expiring before fresh data arrived
+
+### Files Modified
+- `x1c_heater.py`:
+  - Lines 91-93: Added sequence numbering globals
+  - Lines 872-882: Updated `emit_status_update()` with sequence increment
+  - Lines 1010-1013: Added spin animation keyframe
+  - Lines 1060-1085: Added `.processing` and `.processing-blocked` CSS classes
+  - Lines 1636-1651: Added sequence tracking and updated optimistic lock comments
+  - Lines 2427-2465: Enhanced `lockOptimisticUpdate()` with visual indicators
+  - Lines 2589-2592: Moved button declarations to top of WebSocket handler (scoping fix)
+  - Lines 2604-2611: Added sequence validation and logging
+  - Lines 2644-2657: Added indicator update logging
+  - Lines 2075-2091: Updated `startPrint()` with processing indicators
+  - Lines 2127-2163: Updated `stopPrint()` with processing indicators and optimistic updates
+  - Lines 2166-2201: Updated `pausePrint()` with processing indicators
+  - Lines 2222-2253: Updated `emergencyStop()` with processing indicators and optimistic updates
+- `CLAUDE.md`: Updated version history to v2.5
+- `TODO.md`: Moved flickering bug to "Resolved" section
+
+### Testing Results
+- ✅ No flickering when clicking any button
+- ✅ Processing spinners appear on button clicks
+- ✅ Conflicting buttons properly dimmed/disabled
+- ✅ Stale messages dropped (visible in console logs)
+- ✅ All buttons provide instant visual feedback
+- ✅ No JavaScript errors in console
+- ✅ Race conditions prevented
+
+### Performance Impact
+- Negligible - sequence validation is simple integer comparison
+- Optimistic lock increased from 2s to 6s (intentional for reliability)
+- Visual indicators use CSS animations (GPU accelerated)
+- Message drops reduce unnecessary DOM updates
+
+---
+
+**Last Updated:** 2025-11-09

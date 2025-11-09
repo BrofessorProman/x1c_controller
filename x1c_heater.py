@@ -88,6 +88,10 @@ MAX_HISTORY = 1000  # Keep last 1000 data points
 logging_enabled = False
 log_data = []
 
+# WebSocket message sequencing - prevents stale messages from updating UI
+status_sequence_number = 0
+sequence_lock = threading.Lock()
+
 status_data = {
     'current_temp': 0,
     'sensor_temps': [],
@@ -105,7 +109,8 @@ status_data = {
     'phase': 'idle',  # idle, warming up, heating, maintaining, cooling
     'eta_to_target': 0,
     'print_time_remaining': 0,
-    'cooldown_time_remaining': 0
+    'cooldown_time_remaining': 0,
+    'sequence': 0  # Message sequence number to prevent stale updates
 }
 
 # DS18B20 Setup
@@ -865,8 +870,15 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # WebSocket event emitters - for real-time updates to connected clients
 def emit_status_update():
-    """Emit current status to all connected clients"""
+    """Emit current status to all connected clients with sequence number"""
+    global status_sequence_number
+
     with state_lock:
+        # Increment sequence number to identify this message
+        with sequence_lock:
+            status_sequence_number += 1
+            status_data['sequence'] = status_sequence_number
+
         socketio.emit('status_update', status_data, namespace='/')
 
 def emit_notification(title, message):
@@ -995,6 +1007,11 @@ HTML_TEMPLATE = """
             51%, 100% { opacity: 0.3; }
         }
 
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
         .input-group {
             margin: 15px 0;
         }
@@ -1039,6 +1056,34 @@ HTML_TEMPLATE = """
         .button.danger { background: var(--danger-color); color: white; }
         .button.warning { background: var(--warning-color); color: white; }
         .button.secondary { background: #757575; color: white; }
+
+        /* Processing state - button is actively processing user action */
+        .button.processing {
+            position: relative;
+            pointer-events: none;
+            padding-right: 45px !important; /* Make room for spinner */
+        }
+
+        .button.processing::after {
+            content: "";
+            position: absolute;
+            width: 16px;
+            height: 16px;
+            top: 50%;
+            right: 15px;
+            margin-top: -8px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 0.8s linear infinite;
+        }
+
+        /* Processing-blocked state - button interaction temporarily disabled during optimistic lock */
+        .button.processing-blocked {
+            opacity: 0.5;
+            pointer-events: none;
+            cursor: not-allowed;
+        }
 
         .button-group {
             display: flex;
@@ -1621,8 +1666,21 @@ HTML_TEMPLATE = """
         let previousAwaitingPreheat = false; // Track preheat confirmation state
         let isFireAlarmActive = false; // Track fire alarm state to block controls
 
-        // Optimistic update lock - prevents WebSocket from overriding optimistic updates
-        let optimisticUpdateActive = false;
+        /* Anti-Flicker System (Two Layers of Protection)
+         *
+         * Layer 1: Message Sequence Validation
+         *   - Backend assigns incrementing sequence numbers to each WebSocket message
+         *   - Frontend drops any message with older sequence number than last received
+         *   - Prevents stale queued messages from overriding newer state (permanent protection)
+         *
+         * Layer 2: Optimistic Update Lock (2-second window)
+         *   - When user clicks button, UI updates immediately (optimistic)
+         *   - Lock prevents WebSocket from overriding optimistic changes for 2 seconds
+         *   - Gives backend time to process action and send fresh data
+         *   - Works with Layer 1 to provide instant feedback while preventing flicker
+         */
+        let lastReceivedSequence = 0;  // Layer 1: Track latest message sequence
+        let optimisticUpdateActive = false;  // Layer 2: Temporary lock during user actions
         let optimisticUpdateTimer = null;
 
         // Temperature conversion functions
@@ -2016,13 +2074,18 @@ HTML_TEMPLATE = """
         }
 
         async function startPrint() {
-            // Lock optimistic updates to prevent WebSocket from overriding
-            lockOptimisticUpdate();
+            console.log(`[CLICK] START clicked - last seq=${lastReceivedSequence}`);
 
-            // Optimistic UI update - disable START button immediately for instant feedback
+            // Get button references
             const startBtn = document.getElementById('start-btn');
             const pauseBtn = document.getElementById('pause-btn');
             const stopBtn = document.getElementById('stop-btn');
+
+            // Lock optimistic updates with processing indicators
+            // START is processing, STOP/PAUSE are blocked from interaction
+            lockOptimisticUpdate(startBtn, [stopBtn, pauseBtn]);
+
+            // Optimistic UI update - disable START button immediately for instant feedback
 
             startBtn.disabled = true;
             pauseBtn.disabled = false;
@@ -2063,17 +2126,28 @@ HTML_TEMPLATE = """
         }
 
         async function stopPrint() {
-            // Lock optimistic updates to prevent WebSocket from overriding
-            lockOptimisticUpdate();
+            console.log(`[CLICK] STOP clicked - last seq=${lastReceivedSequence}`);
 
-            // Optimistic UI update - enable START, disable STOP/PAUSE immediately
+            // Get button references
             const startBtn = document.getElementById('start-btn');
             const pauseBtn = document.getElementById('pause-btn');
             const stopBtn = document.getElementById('stop-btn');
 
+            // Lock optimistic updates with processing indicators
+            // STOP is processing, START/PAUSE are blocked from interaction
+            lockOptimisticUpdate(stopBtn, [startBtn, pauseBtn]);
+
+            // Optimistic UI update - enable START, disable STOP/PAUSE immediately
+
             startBtn.disabled = false;
             pauseBtn.disabled = true;
             stopBtn.disabled = true;
+
+            // Optimistic UI updates - turn off heater and fans immediately for instant feedback
+            document.getElementById('heater-ind').className = 'indicator off';
+            document.getElementById('heater-toggle').checked = false;
+            document.getElementById('fans-ind').className = 'indicator off';
+            document.getElementById('fans-toggle').checked = false;
 
             try {
                 const response = await fetch('/stop', {method: 'POST'});
@@ -2091,11 +2165,16 @@ HTML_TEMPLATE = """
         }
 
         async function pausePrint() {
-            // Lock optimistic updates to prevent WebSocket from overriding
-            lockOptimisticUpdate();
+            // Get button references
+            const pauseBtn = document.getElementById('pause-btn');
+            const startBtn = document.getElementById('start-btn');
+            const stopBtn = document.getElementById('stop-btn');
+
+            // Lock optimistic updates with processing indicators
+            // PAUSE is processing, START/STOP are blocked from interaction
+            lockOptimisticUpdate(pauseBtn, [startBtn, stopBtn]);
 
             // Optimistic UI update - toggle pause button appearance immediately
-            const pauseBtn = document.getElementById('pause-btn');
             const wasPaused = pauseBtn.textContent.includes('RESUME');
 
             if (wasPaused) {
@@ -2145,6 +2224,30 @@ HTML_TEMPLATE = """
             if (!confirm('Emergency stop will immediately halt heater and fans. Continue?')) {
                 return;
             }
+
+            console.log(`[CLICK] EMERGENCY STOP clicked - last seq=${lastReceivedSequence}`);
+
+            // Get button references
+            const emergencyStopBtn = document.getElementById('emergency-stop-btn');
+            const startBtn = document.getElementById('start-btn');
+            const pauseBtn = document.getElementById('pause-btn');
+            const stopBtn = document.getElementById('stop-btn');
+
+            // Lock optimistic updates with processing indicators
+            // EMERGENCY STOP is processing, all other action buttons are blocked
+            lockOptimisticUpdate(emergencyStopBtn, [startBtn, pauseBtn, stopBtn]);
+
+            // Optimistic UI updates - update buttons immediately for instant feedback
+
+            startBtn.disabled = false;
+            pauseBtn.disabled = true;
+            stopBtn.disabled = true;
+
+            // Optimistic UI updates - turn off heater and fans immediately for instant feedback
+            document.getElementById('heater-ind').className = 'indicator off';
+            document.getElementById('heater-toggle').checked = false;
+            document.getElementById('fans-ind').className = 'indicator off';
+            document.getElementById('fans-toggle').checked = false;
 
             try {
                 const response = await fetch('/emergency_stop', {method: 'POST'});
@@ -2337,20 +2440,44 @@ HTML_TEMPLATE = """
             }
         }
 
-        // Enable optimistic update lock to prevent WebSocket from overriding for 2 seconds
-        function lockOptimisticUpdate() {
+        // Enable optimistic update lock to prevent WebSocket from overriding for 6 seconds
+        // Also manages visual processing indicators and conflict prevention
+        function lockOptimisticUpdate(activeButton, blockedButtons = []) {
+            const lockTime = Date.now();
             optimisticUpdateActive = true;
+            console.log(`[LOCK] Optimistic lock ENABLED at +0ms for ${activeButton.id}`);
+
+            // Add processing spinner to the clicked button
+            activeButton.classList.add('processing');
+
+            // Block conflicting buttons from being clicked
+            blockedButtons.forEach(btn => {
+                if (btn && !btn.disabled) {
+                    btn.classList.add('processing-blocked');
+                }
+            });
 
             // Clear existing timer if any
             if (optimisticUpdateTimer) {
                 clearTimeout(optimisticUpdateTimer);
             }
 
-            // Auto-clear after 2 seconds (backend should have processed by then)
+            // Auto-clear after 6 seconds (increased from 2s to ensure backend has processed)
             optimisticUpdateTimer = setTimeout(() => {
+                const elapsed = Date.now() - lockTime;
                 optimisticUpdateActive = false;
                 optimisticUpdateTimer = null;
-            }, 2000);
+
+                // Remove processing indicators
+                activeButton.classList.remove('processing');
+                blockedButtons.forEach(btn => {
+                    if (btn) {
+                        btn.classList.remove('processing-blocked');
+                    }
+                });
+
+                console.log(`[LOCK] Optimistic lock EXPIRED at +${elapsed}ms`);
+            }, 6000);
         }
 
         function updateStatus() {
@@ -2585,6 +2712,20 @@ HTML_TEMPLATE = """
 
         // Real-time status updates via WebSocket
         socket.on('status_update', (data) => {
+            // Validate message sequence - ignore stale messages
+            if (data.sequence <= lastReceivedSequence) {
+                console.log(`[WS] DROPPED stale message: seq=${data.sequence}, last=${lastReceivedSequence}, heater=${data.heater_on}, fans=${data.fans_on}`);
+                return; // Drop this stale message
+            }
+            console.log(`[WS] ACCEPTED message: seq=${data.sequence}, heater=${data.heater_on}, fans=${data.fans_on}, lock=${optimisticUpdateActive}`);
+            lastReceivedSequence = data.sequence;
+
+            // Get button references at top of handler (needed by multiple sections below)
+            const startBtn = document.getElementById('start-btn');
+            const pauseBtn = document.getElementById('pause-btn');
+            const stopBtn = document.getElementById('stop-btn');
+            const emergencyStopBtn = document.getElementById('emergency-stop-btn');
+
             // Always update temperature displays (not affected by optimistic lock)
             document.getElementById('temp').textContent = formatTemp(data.current_temp);
             document.getElementById('setpoint').textContent = formatTemp(data.setpoint);
@@ -2597,6 +2738,7 @@ HTML_TEMPLATE = """
 
             // Skip button/toggle updates if optimistic update is active (prevents flickering)
             if (!optimisticUpdateActive) {
+                console.log(`[WS] Updating indicators: heater=${data.heater_on}, fans=${data.fans_on} (lock=${optimisticUpdateActive})`);
                 // Update indicators
                 document.getElementById('heater-ind').className = 'indicator ' + (data.heater_on ? 'on' : 'off');
                 document.getElementById('fans-ind').className = 'indicator ' + (data.fans_on ? 'on' : 'off');
@@ -2606,6 +2748,8 @@ HTML_TEMPLATE = """
                 document.getElementById('heater-toggle').checked = data.heater_on;
                 document.getElementById('fans-toggle').checked = data.fans_on;
                 document.getElementById('lights-toggle').checked = data.lights_on;
+            } else {
+                console.log(`[WS] SKIPPED indicator update due to optimistic lock (heater=${data.heater_on}, fans=${data.fans_on})`);
             }
 
             // Update status text
@@ -2614,10 +2758,7 @@ HTML_TEMPLATE = """
 
             // Skip button updates if optimistic update is active (prevents flickering)
             if (!optimisticUpdateActive) {
-                // Update buttons
-                const startBtn = document.getElementById('start-btn');
-                const pauseBtn = document.getElementById('pause-btn');
-                const stopBtn = document.getElementById('stop-btn');
+                // Update button states based on print status
 
                 if (data.print_active) {
                     startBtn.disabled = true;
@@ -2655,7 +2796,6 @@ HTML_TEMPLATE = """
             // Fire alert
             const alert = document.getElementById('fire-alert');
             const resetBtn = document.getElementById('reset-btn');
-            const emergencyStopBtn = document.getElementById('emergency-stop-btn');
             const heaterToggle = document.getElementById('heater-toggle');
             const fansToggle = document.getElementById('fans-toggle');
             const lightsToggle = document.getElementById('lights-toggle');
