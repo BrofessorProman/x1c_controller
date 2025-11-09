@@ -14,11 +14,16 @@
 - Temperature display and graph work correctly
 
 **Root Cause Analysis:**
+- **CRITICAL ERROR FOUND:** JavaScript error in WebSocket handler: `Uncaught ReferenceError: startBtn is not defined`
+  - Error occurs at (index):1859:17 inside WebSocket event handler
+  - Error happens inside `socket.on('status_update')` callback
+  - This error prevents WebSocket handler from completing, leaving UI in inconsistent state
+  - **This is likely the PRIMARY cause of flickering!**
 - Optimistic UI updates occur instantly when user clicks button
 - Flask route sets flag (`start_requested = True`) but doesn't update `status_data`
 - Idle loop (sleeping for 1 second) emits WebSocket with OLD state during optimistic lock period
-- WebSocket bypasses optimistic lock for some reason, overriding UI
-- 2 seconds later, optimistic lock expires and WebSocket corrects state again
+- WebSocket handler throws error trying to access `startBtn` before it's defined
+- Error prevents proper state updates, causing UI inconsistency
 - Result: Multiple state changes create flickering effect
 
 **Attempted Solutions:**
@@ -29,17 +34,29 @@
 5. ❌ Still experiencing flickering despite lock mechanism
 
 **Potential Solutions to Try:**
-1. Increase optimistic lock duration from 2 seconds to 3-4 seconds
-2. Stop idle loop from emitting during optimistic lock period
-3. Have Flask routes immediately update `status_data` AND emit WebSocket (instead of just setting flag)
-4. Add debouncing to WebSocket updates
-5. Investigate why optimistic lock check isn't preventing all WebSocket updates
+1. **PRIORITY FIX:** Find where `startBtn` is being accessed before definition (line ~1859)
+   - Move button variable declarations OUTSIDE the `if (!optimisticUpdateActive)` block
+   - Declare `startBtn`, `pauseBtn`, `stopBtn` at top of WebSocket handler
+   - Only the actual assignments should be inside the optimistic lock check
+2. Add error handling/try-catch around WebSocket button updates
+3. Increase optimistic lock duration from 2 seconds to 3-4 seconds
+4. Stop idle loop from emitting during optimistic lock period
+5. Have Flask routes immediately update `status_data` AND emit WebSocket (instead of just setting flag)
+6. Add debouncing to WebSocket updates
 
 **Code Locations:**
 - Optimistic lock: `x1c_heater.py` lines 1624-1626, 2331-2345
 - Lock usage in buttons: lines 2020, 2067, 2095
 - WebSocket handler with lock check: lines 2598-2609, 2615-2653
+- **ERROR LINE:** ~line 1859 (from browser error - need to find actual line in x1c_heater.py)
 - Idle loop emissions: line 471
+
+**Debugging Steps for Next Session:**
+1. Open browser console (F12) and note exact error line number
+2. Search x1c_heater.py for where HTML_TEMPLATE starts (around line 855)
+3. Count lines from HTML start to find line 1859 in browser = line X in Python file
+4. Check if `startBtn` is used before `const startBtn = document.getElementById('start-btn')`
+5. Look for button variables being accessed outside their scope
 
 **Related Issue:**
 - STOP button should immediately turn off heater/fans indicators (add optimistic update to stopPrint())
