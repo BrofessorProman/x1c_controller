@@ -2,7 +2,7 @@
 
 ## 🐛 Active Bugs
 
-*No active bugs at this time!*
+
 
 ---
 
@@ -404,6 +404,240 @@ The flickering was caused by three issues working together:
 - Optimistic lock increased from 2s to 6s (intentional for reliability)
 - Visual indicators use CSS animations (GPU accelerated)
 - Message drops reduce unnecessary DOM updates
+
+---
+
+## 📝 Print State Persistence & Crash Recovery Session (2025-11-09)
+
+### Changes Implemented ✅
+
+1. **Print State Persistence System**
+   - Created `save_print_state()` function to serialize current print state to JSON
+   - Created `load_print_state()` function with intelligent staleness validation
+   - Created `delete_print_state()` function for cleanup
+   - State file: `print_state.json` (excluded from git via .gitignore)
+   - Auto-saves every 10 seconds during heating/maintaining
+   - Auto-saves every 5 minutes (per step) during cooldown
+
+2. **State Schema**
+   - Timestamp, phase, start_time, print_duration
+   - Pause state (is_paused, pause_time_accumulated)
+   - Target temp, fans_enabled, logging_enabled, time_adjustments
+   - Manual override states (heater_manual_override, fans_manual_override)
+   - Hardware states (heater_on, fans_on)
+
+3. **Intelligent Staleness Validation**
+   - Different validation logic for cooling vs heating/maintaining phases
+   - Heating/maintaining: validates state hasn't exceeded remaining print time + 5min grace
+   - Cooling: validates state is within max cooldown duration (12 hours)
+   - Auto-aborts stale states that can't be meaningfully resumed
+   - Backward compatible with old state files (defaults to Auto/OFF if fields missing)
+
+4. **Resume UI**
+   - Orange warning banner with "🔄 Print Interrupted" message
+   - Displays immediately on page load if valid state found
+   - Two buttons: "▶ RESUME PRINT" and "✖ ABORT"
+   - Banner checks on page load (HTTP) and updates via WebSocket
+
+5. **Resume Logic**
+   - Calculates elapsed time since crash
+   - Adjusts start_time to preserve correct remaining time
+   - Restores pause state if print was paused during crash
+   - Restores manual override flags (Auto/Manual mode)
+   - Restores actual hardware GPIO states (heater/fans ON/OFF)
+   - Skips warmup phase when resuming (no redundant heating)
+
+6. **Cooling Phase Resume**
+   - Fixed stale detection bug (was incorrectly deleting valid cooling states)
+   - Calculates remaining cooldown time and continues from that point
+   - Skips heating loop entirely when resuming from cooling
+   - Shows correct cooldown time remaining in UI immediately
+
+7. **API Routes**
+   - `POST /resume_print` - Resume interrupted print cycle
+   - `POST /abort_resume` - Discard saved state and return to idle
+
+8. **UI Improvements**
+   - Fixed probe name update delay (avoids slow sensor reads, emits immediate WebSocket)
+   - Fixed processing spinner cleanup (new `clearAllProcessingStates()` function)
+   - Added optimistic notifications for pause/resume (instant feedback)
+   - Fixed heater UI sync during cooling (emits WebSocket when heater turns off)
+
+### Files Modified
+- `x1c_heater.py`:
+  - Lines 22: Added `PRINT_STATE_FILE` constant
+  - Lines 222-244: `save_print_state()` function (with manual override fields)
+  - Lines 246-311: `load_print_state()` function (with staleness validation)
+  - Lines 313-320: `delete_print_state()` function
+  - Lines 255-263: Backward compatibility defaults
+  - Lines 488-593: `slow_cool()` - state saving during cooldown
+  - Lines 600-1150: `main_loop()` - resume logic, state loading, timing calculations
+  - Lines 1563-1575: Resume banner HTML
+  - Lines 2803-2817: `clearAllProcessingStates()` function
+  - Lines 2515, 2521: Optimistic pause/resume notifications
+  - Lines 564: Heater UI sync emit during cooling
+  - Lines 3435-3455: `/resume_print` route
+  - Lines 3457-3470: `/abort_resume` route
+  - Lines 2280-2304: `checkResumeBanner()` function
+- `.gitignore`: Already had `print_state.json` excluded
+- `CLAUDE.md`: Updated version history to v2.6
+- `TODO.md`: This file
+
+### Testing Status
+- ✅ Resume from heating phase works correctly
+- ✅ Resume from maintaining phase works correctly
+- ✅ Resume from cooling phase works correctly
+- ✅ Pause state preserved across crashes
+- ✅ Manual override states preserved across crashes
+- ✅ Hardware states (heater/fans ON/OFF) preserved
+- ✅ Cooldown time calculation correct when resuming
+- ✅ Stale detection works for all phases
+- ✅ Banner appears immediately on page load
+- ✅ Probe name updates are instant
+- ✅ Processing spinners clean up properly
+- ✅ Pause/resume notifications appear instantly
+- ✅ Heater UI syncs correctly during cooling
+
+---
+
+## 🎯 Future Enhancements
+
+### 🎨 Rearrangeable Dashboard Cards (Planned for Next Session)
+**Priority:** Medium
+**Status:** Planning Phase
+
+**Goal:**
+Transform the current fixed-layout dashboard into a flexible, user-customizable tile-based system where users can rearrange, resize, and show/hide different information cards.
+
+**Implementation Plan:**
+
+1. **Technology Choice**
+   - **Option A: GridStack.js** (Recommended)
+     - Drag-and-drop grid layout library
+     - Touch support for mobile/tablet
+     - Responsive breakpoints
+     - Save/restore layouts via JSON
+     - ~40KB minified
+     - MIT License
+   - **Option B: Muuri**
+     - More lightweight (~33KB)
+     - Smooth animations
+     - Less feature-rich than GridStack
+   - **Option C: Custom CSS Grid + Drag API**
+     - No dependencies
+     - More development time
+     - Full control
+
+2. **Card Types to Implement**
+   - **Temperature Card**: Current temp, setpoint, ETA (currently in top section)
+   - **Control Panel Card**: START/STOP/PAUSE/EMERGENCY STOP buttons (currently center)
+   - **Settings Card**: Target temp, print time, fans/logging toggles (currently center)
+   - **Time Display Card**: Print time remaining, cooldown time (currently top)
+   - **Phase Status Card**: Current phase, elapsed time (currently top)
+   - **Indicators Card**: Heater/Fans/Lights toggles with indicators (currently right side)
+   - **Presets Card**: Quick preset buttons (currently bottom)
+   - **Sensor List Card**: Individual probe temperatures (currently bottom)
+   - **Temperature Graph Card**: Real-time chart (currently bottom - already large)
+
+3. **Layout System**
+   - Default layout: Similar to current fixed layout
+   - Grid-based: 12-column responsive grid
+   - Breakpoints: Desktop (1200px+), Tablet (768-1199px), Mobile (<768px)
+   - Each card has min/max size constraints
+   - Cards snap to grid for clean alignment
+
+4. **Persistence**
+   - Save layout to `heater_settings.json` under `dashboard_layout` key
+   - Store: card IDs, positions (x, y), sizes (w, h), visibility
+   - Load layout on page load
+   - "Reset to Default" button to restore original layout
+
+5. **User Interface**
+   - **Edit Mode Toggle**: Button in header to enter/exit edit mode
+   - **In Edit Mode**:
+     - Drag cards to reposition
+     - Resize handles on card corners
+     - "👁 Show/Hide" menu to toggle card visibility
+     - Locked cards (optional): certain cards cannot be hidden (e.g., control panel)
+   - **Visual Indicators**:
+     - Dashed borders when in edit mode
+     - Drag handles visible
+     - Placeholder shown when dragging
+
+6. **Mobile Considerations**
+   - Touch-friendly drag/drop
+   - Larger touch targets in edit mode
+   - Single-column layout on mobile (stack cards vertically)
+   - Swipe gestures for showing/hiding cards
+
+7. **Implementation Steps**
+   - [ ] Choose library (recommend GridStack.js)
+   - [ ] Refactor HTML to create card components
+   - [ ] Add GridStack.js CSS/JS to page
+   - [ ] Create default layout configuration
+   - [ ] Implement drag-and-drop functionality
+   - [ ] Add edit mode toggle
+   - [ ] Implement save/load layout to settings
+   - [ ] Add show/hide card menu
+   - [ ] Add "Reset to Default" button
+   - [ ] Test responsive behavior on mobile/tablet
+   - [ ] Add visual polish (animations, transitions)
+
+8. **Backend Changes Required**
+   - Minimal - only need to persist `dashboard_layout` in settings
+   - Add new field to `heater_settings.json`
+   - No new routes required (uses existing `/save_settings`)
+
+9. **Estimated Complexity**
+   - **Using GridStack.js**: 4-6 hours
+     - 1-2 hours: HTML refactoring into cards
+     - 1 hour: GridStack integration
+     - 1 hour: Save/load layout logic
+     - 1-2 hours: Polish and responsive testing
+   - **Custom implementation**: 8-12 hours
+
+10. **Benefits**
+    - Users can prioritize information they care about most
+    - Cleaner interface - hide cards not needed
+    - Better use of screen space
+    - Tablet-friendly layout customization
+    - Future-proof: easy to add new card types
+
+11. **Potential Challenges**
+    - Maintaining WebSocket updates with rearranged cards
+    - Ensuring cards update correctly regardless of position
+    - Mobile layout constraints (limited screen space)
+    - Accessibility considerations for drag-and-drop
+
+12. **Nice-to-Have Features** (Future iterations)
+    - Multiple saved layouts (e.g., "Monitoring", "Control", "Detailed")
+    - Export/import layouts
+    - Card color themes
+    - Collapsible cards (minimize to title bar only)
+    - Keyboard shortcuts for common layouts
+
+**Files to Modify:**
+- `x1c_heater.py`:
+  - HTML section: Refactor into card components with GridStack classes
+  - Add GridStack.js and CSS CDN links
+  - JavaScript: Initialize GridStack, save/load layout functions
+- `heater_settings.json`: Add `dashboard_layout` field (auto-created on first save)
+
+**Dependencies:**
+- GridStack.js: https://gridstackjs.com/
+- CDN: https://cdn.jsdelivr.net/npm/gridstack@latest/dist/gridstack-all.min.js
+
+**Testing Checklist:**
+- [ ] Cards can be dragged and dropped
+- [ ] Cards can be resized
+- [ ] Layout persists across page reloads
+- [ ] Layout persists across service restarts
+- [ ] Reset to default works correctly
+- [ ] Mobile layout is usable
+- [ ] WebSocket updates work with rearranged cards
+- [ ] All buttons and controls work in any position
+- [ ] Edit mode toggle works
+- [ ] Show/hide card menu works
 
 ---
 

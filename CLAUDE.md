@@ -21,6 +21,7 @@ This is a Raspberry Pi-based temperature controller for a 3D printer chamber hea
 - ✅ Configurable cooldown target temperature - reliable cooldown to user-set temp
 - ✅ GPIO state detection on restart - syncs software/hardware state
 - ✅ Fire alarm UI lockdown - comprehensive safety controls during emergency
+- ✅ Print state persistence and crash recovery - resume interrupted prints after crashes or restarts
 
 ## Quick Start
 
@@ -642,7 +643,55 @@ See `TODO.md` for planned improvements including:
 
 ## Version History
 
-**Current Version**: 2.5 (WebSocket Real-Time Communication & UI Polish)
+**Current Version**: 2.6 (Print State Persistence & Crash Recovery)
+- **NEW**: Comprehensive print state persistence system
+  - Automatically saves print state every 10 seconds during heating/maintaining phases
+  - Saves state every 5 minutes during cooldown phase
+  - State includes: phase, timing info, pause state, target temp, manual overrides, hardware states
+  - Resume banner appears on page load if crash detected
+  - User can choose to resume or abort interrupted print
+- **NEW**: Intelligent crash recovery with staleness validation
+  - Different validation for heating vs cooling phases
+  - Heating/maintaining: validates against remaining print time (+ 5min grace period)
+  - Cooling: validates state is within max cooldown duration (12 hours)
+  - Auto-aborts stale states that can't be meaningfully resumed
+- **NEW**: Resume logic preserves exact timing and state
+  - Calculates elapsed time since crash and adjusts start time accordingly
+  - Shows correct remaining time when resuming
+  - Preserves pause state if print was paused during crash
+  - Restores manual override flags (heater/fans manual/auto mode)
+  - Restores actual hardware states (heater/fans on/off)
+- **NEW**: Cooling phase crash recovery fully working
+  - Skips warmup phase when resuming (no redundant heating)
+  - Calculates remaining cooldown time and continues from that point
+  - Shows correct cooldown time remaining in UI immediately
+  - Fixed stale detection bug that was deleting valid cooling states
+- **NEW**: API routes for crash recovery
+  - `/resume_print` - Resume interrupted print cycle
+  - `/abort_resume` - Discard saved state and return to idle
+- **IMPROVED**: Probe name updates are instant
+  - Avoids slow sensor reads when saving settings
+  - Updates names in existing sensor data structure
+  - Emits immediate WebSocket update for instant UI refresh
+- **IMPROVED**: Processing spinner cleanup
+  - Added `clearAllProcessingStates()` function
+  - Clears spinners from all buttons before applying new ones
+  - Prevents leftover spinners when clicking buttons rapidly
+  - Ensures only one button shows spinner at a time
+- **IMPROVED**: Optimistic notifications for pause/resume
+  - "Print Paused" notification appears immediately when clicking PAUSE
+  - "Print Resumed" notification appears immediately when clicking RESUME
+  - No delay waiting for backend response
+- **FIXED**: Heater UI sync during cooling phase
+  - Cooling loop now emits WebSocket update when turning off heater
+  - UI shows correct heater state in real-time
+  - Fixes issue where UI showed stale "ON" state until something else triggered an emit
+- **FIXED**: Backward compatibility for old state files
+  - Gracefully handles state files without manual override fields
+  - Defaults to Auto mode and OFF state if fields missing
+- All features from version 2.5 and earlier
+
+**Version 2.5**: (WebSocket Real-Time Communication & UI Polish)
 - **NEW**: Real-time WebSocket communication replaces HTTP polling
   - Migrated from 2-second polling to instant WebSocket push updates
   - Server-to-browser latency reduced from 0-2000ms to <50ms

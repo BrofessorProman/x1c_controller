@@ -27,6 +27,7 @@ env/
 
 # Settings and logs (contains user data)
 heater_settings.json
+print_state.json
 temperature_log*.csv
 
 # IDE
