@@ -11,13 +11,16 @@ This is a Raspberry Pi-based temperature controller for a 3D printer chamber hea
 - ✅ Runs as systemd service - persistent, auto-starts on boot
 - ✅ Remote access via WireGuard VPN
 - ✅ Real-time temperature graphing with dark mode
-- ✅ Comprehensive settings menu with temperature units (C/F), adjustable hysteresis, and probe renaming
-- ✅ Browser notifications and CSV logging
+- ✅ Comprehensive settings menu with temperature units (C/F), adjustable hysteresis, probe renaming, skip preheat, and cooldown target
+- ✅ In-page modal notifications and CSV logging
 - ✅ Preset configurations and settings persistence
 - ✅ Git version control with GitHub integration
 - ✅ Pause/Resume functionality - pause print timer while maintaining temperature
-- ✅ Preheat phase - reaches target temperature before starting print timer
+- ✅ Preheat phase - reaches target temperature before starting print timer (optional skip)
 - ✅ Optional preheat confirmation - wait for user confirmation before starting print
+- ✅ Configurable cooldown target temperature - reliable cooldown to user-set temp
+- ✅ GPIO state detection on restart - syncs software/hardware state
+- ✅ Fire alarm UI lockdown - comprehensive safety controls during emergency
 
 ## Quick Start
 
@@ -638,28 +641,48 @@ See `TODO.md` for planned improvements including:
 
 ## Version History
 
-**Current Version**: 2.2 (Pause, Preheat & Control Improvements)
-- **NEW**: Pause/Resume functionality - pause print timer while maintaining temperature control
-- **NEW**: Warming up phase - reaches target temperature before starting print timer
-- **NEW**: Optional preheat confirmation - wait for user confirmation before starting print timer
-- **NEW**: Preheat confirmation modal with browser notification
-- **IMPROVED**: Manual overrides automatically clear when START is clicked
-- **IMPROVED**: Print time resets properly when STOP or EMERGENCY STOP is clicked
-- **IMPROVED**: Print time displays correctly reset to 0 when print cycle ends
-- Comprehensive settings modal with dark mode, temp units, hysteresis, cooldown, and probe renaming
-- Temperature unit switching (Celsius/Fahrenheit) with automatic conversion
-- User-configurable hysteresis (0.5-10°C) for heater control
-- User-configurable cooldown time (0-12 hours)
-- Custom probe naming for easy sensor identification
-- Git version control with GitHub integration (SSH)
-- Fully web-controlled interface
-- Systemd service integration
-- Remote access support
-- Real-time temperature graphing
-- Browser notifications
-- CSV logging
-- Preset management
-- Settings persistence
+**Current Version**: 2.3.1 (Bug Fix - Temperature Sensor Display)
+- **NEW**: Skip Preheat setting - option to bypass warming up phase and start timer immediately
+- **NEW**: Cooldown Target Temperature setting - user-configurable target temp for cooldown phase (default 21°C/70°F)
+  - Replaces unreliable startup-based ambient temperature detection
+  - Ensures consistent and predictable cooldown behavior
+- **NEW**: GPIO state detection on service restart - syncs software state with hardware state on startup
+  - Prevents mismatch between UI and actual heater/fan states after service restart
+  - Logs warning when outputs are detected as ON during startup
+- **NEW**: Comprehensive fire alarm UI lockdown - all controls disabled except RESET button during fire alarm
+  - Blocks START, PAUSE, STOP, EMERGENCY STOP buttons
+  - Disables heater, fans, and lights toggles (with JavaScript enforcement)
+  - Disables all configuration inputs, time adjustments, presets, and Settings button
+  - Visual dimming (40% opacity) to indicate locked state
+  - Critical safety feature preventing user from restarting heater during fire
+- **NEW**: Continuous temperature reading while idle - probes update every 5 seconds even before START is clicked
+  - Allows user to monitor chamber temperature before starting print
+- **NEW**: In-page modal notifications - replaced browser notifications with custom toast notifications
+  - Works on HTTP/IP addresses (browser notifications require HTTPS)
+  - Auto-dismiss after 3-5 seconds with blur overlay effect
+- **FIXED**: Cooldown phase crash - TypeError with float object in range() function
+  - Added int() conversion to cooldown step calculation
+- **FIXED**: Hysteresis returning None - added safety checks to use default value if setting is null
+- **FIXED**: Fans not shutting off in manual mode - STOP/EMERGENCY STOP now force all outputs off regardless of manual override
+- **IMPROVED**: Print time clears to 0 when entering cooldown phase
+- **IMPROVED**: Phase display shows "WARMING UP" instead of "WARMING_UP" (cosmetic fix)
+- **IMPROVED**: Emergency stop message refers to "fans" instead of "heating and cooling fans"
+- **IMPROVED**: Warming up phase skipped if already at or above target temperature
+- **FIXED**: Temperature probes not displaying on main interface
+  - Emergency Stop button was missing id="emergency-stop-btn"
+  - JavaScript error prevented updateStatus() from completing
+  - Sensor list now displays correctly with proper temperature readings
+- All features from version 2.2 and earlier
+
+**Version 2.2**: (Pause, Preheat & Control Improvements)
+- Pause/Resume functionality - pause print timer while maintaining temperature control
+- Warming up phase - reaches target temperature before starting print timer
+- Optional preheat confirmation - wait for user confirmation before starting print timer
+- Preheat confirmation modal with browser notification
+- Manual overrides automatically clear when START is clicked
+- Print time resets properly when STOP or EMERGENCY STOP is clicked
+- Print time displays correctly reset to 0 when print cycle ends
+- All features from version 2.1
 
 **Version 2.1**: (Advanced Settings & Version Control)
 - Comprehensive settings modal with dark mode, temp units, hysteresis, cooldown, and probe renaming

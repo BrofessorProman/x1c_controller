@@ -15,15 +15,17 @@ A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber
 - 💾 **Data Logging** - Export temperature logs as CSV
 - 🎨 **Dark Mode** - Eye-friendly interface with settings modal
 - 🌡️ **Temperature Units** - Switch between Celsius and Fahrenheit
-- ⚙️ **Advanced Settings** - Configurable hysteresis, cooldown time, and probe naming
-- 🔔 **Browser Notifications** - Alerts for key events
+- ⚙️ **Advanced Settings** - Configurable hysteresis, cooldown time, cooldown target temp, probe naming, and skip preheat
+- 🔔 **In-Page Notifications** - Custom modal notifications (works on HTTP)
 - 📱 **Mobile Friendly** - Responsive design for phones/tablets
 - 🔒 **Remote Access** - WireGuard VPN support
 - 💾 **Preset Configs** - Save and load common settings
 - 🔄 **Auto-Start** - Runs as systemd service
 - ⏸️ **Pause/Resume** - Pause print timer while maintaining temperature
-- 🔥 **Preheat Phase** - Reaches target temp before starting print timer
+- 🔥 **Preheat Phase** - Reaches target temp before starting print timer (optional skip)
 - ✅ **Preheat Confirmation** - Optional wait for user approval to start print
+- 🔐 **Fire Alarm Lockdown** - All controls disabled during fire emergency
+- 🔄 **GPIO State Sync** - Detects hardware state on service restart
 
 ## Quick Start
 
@@ -359,6 +361,6 @@ Contributions welcome! Please:
 
 ---
 
-**Version**: 2.2
-**Status**: Production Ready
+**Version**: 2.3.1
+**Status**: Production Ready ✅
 **Last Updated**: 2025-11-08

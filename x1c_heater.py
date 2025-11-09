@@ -40,13 +40,29 @@ GPIO.setup(BUZZER_PIN, GPIO.OUT)
 GPIO.setup(FAN1_PIN, GPIO.OUT)
 GPIO.setup(FAN2_PIN, GPIO.OUT)
 
+# Read current GPIO states on startup to sync with hardware
+# This handles cases where the service was restarted while outputs were on
+startup_heater_state = GPIO.input(RELAY_PIN)
+startup_fan1_state = GPIO.input(FAN1_PIN)
+startup_fan2_state = GPIO.input(FAN2_PIN)
+
 # Global state flags and variables
 emergency_stop = False
 shutdown_requested = False
-fans_on = False
+fans_on = bool(startup_fan1_state or startup_fan2_state)  # Set based on actual GPIO state
 fans_manual_override = False
-heater_on = False
+heater_on = bool(startup_heater_state)  # Set based on actual GPIO state
 heater_manual_override = False
+
+# Log detected startup states
+if heater_on or fans_on:
+    print("="*50)
+    print("GPIO State Detected on Startup:")
+    if heater_on:
+        print("  ⚠️  Heater was ON - syncing state")
+    if fans_on:
+        print("  ⚠️  Fans were ON - syncing state")
+    print("="*50)
 lights_on = False
 print_active = False
 print_paused = False
@@ -76,16 +92,16 @@ status_data = {
     'sensor_temps': [],
     'setpoint': 0,
     'time_remaining': 0,
-    'heater_on': False,
+    'heater_on': heater_on,  # Use actual GPIO state from startup
     'heater_manual': False,
-    'fans_on': False,
+    'fans_on': fans_on,  # Use actual GPIO state from startup
     'fans_manual': False,
     'lights_on': False,
     'emergency_stop': False,
     'print_active': False,
     'print_paused': False,
     'awaiting_preheat_confirmation': False,
-    'phase': 'idle',  # idle, warming_up, heating, maintaining, cooling
+    'phase': 'idle',  # idle, warming up, heating, maintaining, cooling
     'eta_to_target': 0,
     'print_time_remaining': 0,
     'cooldown_time_remaining': 0
@@ -144,7 +160,7 @@ if ambient is None:
     GPIO.cleanup()
     sys.exit(1)
 
-print(f"Detected ambient temperature: {ambient:.1f}°C")
+print(f"Initial chamber temperature: {ambient:.1f}°C")
 
 # Settings Management
 def load_settings():
@@ -158,8 +174,10 @@ def load_settings():
         'logging_enabled': False,
         'hysteresis': 2.0,
         'cooldown_hours': 4.0,
+        'cooldown_target_temp': 21.0,  # Target temp for cooldown phase (21°C = 70°F)
         'temp_unit': 'C',
         'require_preheat_confirmation': False,
+        'skip_preheat': False,  # Skip warming up phase and start timer immediately
         'probe_names': {},
         'presets': [
             {'name': 'ABS Standard', 'temp': 60, 'hours': 8, 'minutes': 0},
@@ -194,6 +212,15 @@ if current_settings.get('probe_names'):
     for sensor_id, custom_name in current_settings['probe_names'].items():
         if custom_name:  # Only update if custom name is not empty
             probe_locations[sensor_id] = custom_name
+
+# Initialize status_data with current sensor readings (after probe names are loaded)
+initial_sensor_data = get_sensor_temps()
+status_data['current_temp'] = ambient
+status_data['sensor_temps'] = [
+    {'id': sid, 'name': name, 'temp': temp}
+    for sid, name, temp in initial_sensor_data
+]
+print(f"Initialized {len(initial_sensor_data)} temperature probe(s) in status data")
 
 # USB Lights Control
 def get_usb_power_status():
@@ -336,17 +363,38 @@ def calculate_eta(current_temp, target_temp):
 
 # Slow Cooling Function
 def slow_cool(pid, hours=COOLDOWN_HOURS):
-    global heater_on, print_active
+    global heater_on, fans_on, print_active, stop_requested, emergency_stop_requested, shutdown_requested, heater_manual_override, fans_manual_override
+
+    # Get cooldown target temperature from settings (default to 21°C if not set)
+    cooldown_target = current_settings.get('cooldown_target_temp', 21.0)
 
     current_set = pid.setpoint
-    steps = hours * 12  # Every 5 min
-    delta = (current_set - ambient) / steps
+    steps = int(hours * 12)  # Every 5 min (convert to int for range())
+    delta = (current_set - cooldown_target) / steps
 
-    print(f"Starting {hours}-hour cooldown from {current_set:.1f}°C to {ambient:.1f}°C")
+    print(f"Starting {hours}-hour cooldown from {current_set:.1f}°C to {cooldown_target:.1f}°C")
     status_data['phase'] = 'cooling'
+    status_data['print_time_remaining'] = 0  # Clear print time when entering cooling phase
 
     for step in range(steps):
+        # Check for stop conditions at the start of each step
         if shutdown_requested or stop_requested or emergency_stop_requested:
+            print("Cooldown interrupted by user")
+            # Immediately turn off heater and fans and reset all state
+            with state_lock:
+                print_active = False
+                heater_on = False
+                if not fans_manual_override:
+                    fans_on = False
+                    GPIO.output(FAN1_PIN, GPIO.LOW)
+                    GPIO.output(FAN2_PIN, GPIO.LOW)
+                GPIO.output(RELAY_PIN, GPIO.LOW)
+                status_data['print_active'] = False
+                status_data['heater_on'] = False
+                status_data['fans_on'] = fans_on
+                status_data['phase'] = 'idle'
+                status_data['print_time_remaining'] = 0
+                status_data['cooldown_time_remaining'] = 0
             break
 
         pid.setpoint -= delta
@@ -364,7 +412,33 @@ def slow_cool(pid, hours=COOLDOWN_HOURS):
             GPIO.output(RELAY_PIN, GPIO.LOW)
             status_data['heater_on'] = False
 
-        time.sleep(COOLDOWN_STEP_INTERVAL)
+        # Sleep in small increments to check for stop conditions more frequently
+        # Instead of sleeping for 300 seconds straight, sleep in 5-second chunks
+        for i in range(COOLDOWN_STEP_INTERVAL // 5):
+            # Check every 5 seconds if stop was requested
+            if shutdown_requested or stop_requested or emergency_stop_requested:
+                print("Cooldown interrupted by user during sleep")
+                # Immediately turn off heater and fans and reset all state
+                with state_lock:
+                    print_active = False
+                    heater_on = False
+                    if not fans_manual_override:
+                        fans_on = False
+                        GPIO.output(FAN1_PIN, GPIO.LOW)
+                        GPIO.output(FAN2_PIN, GPIO.LOW)
+                    GPIO.output(RELAY_PIN, GPIO.LOW)
+                    status_data['print_active'] = False
+                    status_data['heater_on'] = False
+                    status_data['fans_on'] = fans_on
+                    status_data['phase'] = 'idle'
+                    status_data['print_time_remaining'] = 0
+                    status_data['cooldown_time_remaining'] = 0
+                break
+            time.sleep(5)
+
+        # If stop was requested during sleep, break from main loop too
+        if shutdown_requested or stop_requested or emergency_stop_requested:
+            break
 
     print("Cooldown complete.")
     status_data['phase'] = 'idle'
@@ -379,8 +453,20 @@ def main_loop():
 
     while not shutdown_requested:
         # Wait for START command from web interface
+        # While idle, continuously update temperature readings
         while not start_requested and not shutdown_requested:
-            time.sleep(0.5)
+            # Read and update temperatures even when idle
+            avg_temp = get_average_temp()
+            sensor_data = get_sensor_temps()
+
+            if avg_temp is not None:
+                status_data['current_temp'] = avg_temp
+                status_data['sensor_temps'] = [
+                    {'id': sid, 'name': name, 'temp': temp}
+                    for sid, name, temp in sensor_data
+                ]
+
+            time.sleep(5)  # Update every 5 seconds while idle
 
         if shutdown_requested:
             break
@@ -429,11 +515,26 @@ def main_loop():
         # PID Setup
         pid = PID(Kp=2.0, Ki=0.5, Kd=0.1, setpoint=desired_temp, output_limits=(-100, 100))
 
-        # Warming up phase - reach target temp before starting timer
-        status_data['phase'] = 'warming_up'
-        print(f"\nWarming up chamber to {desired_temp}°C...")
+        # Check if we need warming up phase
+        initial_temp = get_average_temp()
+        skip_warmup = False
 
-        while print_active and not shutdown_requested:
+        # Check if user has skip_preheat enabled
+        if current_settings.get('skip_preheat', False):
+            skip_warmup = True
+            warmup_complete = True
+            print("\nSkipping preheat phase (user setting enabled)")
+        elif initial_temp is not None and initial_temp >= desired_temp:
+            # Already at or above target temperature, skip warming up phase
+            skip_warmup = True
+            warmup_complete = True
+            print(f"\nChamber already at target temperature ({initial_temp:.1f}°C >= {desired_temp}°C), skipping warmup")
+        else:
+            # Warming up phase - reach target temp before starting timer
+            status_data['phase'] = 'warming up'
+            print(f"\nWarming up chamber to {desired_temp}°C...")
+
+        while print_active and not shutdown_requested and not skip_warmup:
             # Check for stop conditions during warmup
             if stop_requested or emergency_stop_requested:
                 print("Warmup stopped by user")
@@ -510,7 +611,7 @@ def main_loop():
                             control = pid(avg_temp)
 
                             # Heater control
-                            hysteresis = current_settings.get('hysteresis', HYSTERESIS)
+                            hysteresis = current_settings.get('hysteresis', HYSTERESIS) or HYSTERESIS
                             if not heater_manual_override and not emergency_stop:
                                 if not heater_on and avg_temp < (pid.setpoint - hysteresis):
                                     heater_on = True
@@ -536,7 +637,7 @@ def main_loop():
                 control = pid(avg_temp)
 
                 # Heater control (using configurable hysteresis)
-                hysteresis = current_settings.get('hysteresis', HYSTERESIS)
+                hysteresis = current_settings.get('hysteresis', HYSTERESIS) or HYSTERESIS
                 if not heater_manual_override:
                     if not heater_on and avg_temp < (pid.setpoint - hysteresis):
                         heater_on = True
@@ -667,7 +768,7 @@ def main_loop():
                     control = pid(avg_temp)
 
                     # Heater control (using configurable hysteresis)
-                    hysteresis = current_settings.get('hysteresis', HYSTERESIS)
+                    hysteresis = current_settings.get('hysteresis', HYSTERESIS) or HYSTERESIS
                     if not heater_manual_override:
                         if not heater_on and avg_temp < (pid.setpoint - hysteresis):
                             heater_on = True
@@ -710,14 +811,14 @@ def main_loop():
         with state_lock:
             print_active = False
             heater_on = False
-            if not fans_manual_override:
-                fans_on = False
-                GPIO.output(FAN1_PIN, GPIO.LOW)
-                GPIO.output(FAN2_PIN, GPIO.LOW)
+            fans_on = False
+            # Always turn off all outputs when print ends (ignore manual override for safety)
             GPIO.output(RELAY_PIN, GPIO.LOW)
+            GPIO.output(FAN1_PIN, GPIO.LOW)
+            GPIO.output(FAN2_PIN, GPIO.LOW)
             status_data['print_active'] = False
             status_data['heater_on'] = False
-            status_data['fans_on'] = fans_on
+            status_data['fans_on'] = False
             status_data['phase'] = 'idle'
             status_data['print_time_remaining'] = 0
             stop_requested = False
@@ -1073,7 +1174,76 @@ HTML_TEMPLATE = """
         .settings-section h3 {
             margin: 0 0 15px 0;
             font-size: 16px;
+        }
+
+        /* In-page notification toast */
+        .notification-toast {
+            display: none;
+            position: fixed;
+            z-index: 2000;
+            left: 50%;
+            top: 20%;
+            transform: translate(-50%, -50%);
+            background-color: var(--card-bg);
+            border: 2px solid var(--primary-color);
+            border-radius: 10px;
+            padding: 20px 30px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            min-width: 300px;
+            max-width: 500px;
+            text-align: center;
+            cursor: pointer;
+            animation: slideIn 0.3s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translate(-50%, -60%);
+            }
+            to {
+                opacity: 1;
+                transform: translate(-50%, -50%);
+            }
+        }
+
+        @keyframes slideOut {
+            from {
+                opacity: 1;
+                transform: translate(-50%, -50%);
+            }
+            to {
+                opacity: 0;
+                transform: translate(-50%, -40%);
+            }
+        }
+
+        .notification-toast.hiding {
+            animation: slideOut 0.3s ease-out forwards;
+        }
+
+        .notification-toast h3 {
+            margin: 0 0 10px 0;
+            font-size: 20px;
             color: var(--primary-color);
+        }
+
+        .notification-toast p {
+            margin: 0;
+            font-size: 16px;
+            color: var(--text-color);
+        }
+
+        .notification-overlay {
+            display: none;
+            position: fixed;
+            z-index: 1999;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.3);
+            backdrop-filter: blur(3px);
         }
 
         .probe-rename {
@@ -1119,7 +1289,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="header">
         <h1>🔥 X1C Chamber Heater Controller</h1>
-        <button class="theme-toggle" onclick="openSettings()">⚙️ Settings</button>
+        <button class="theme-toggle" id="settings-btn" onclick="openSettings()">⚙️ Settings</button>
     </div>
 
     <div id="fire-alert" class="alert danger" style="display: none;">
@@ -1173,6 +1343,12 @@ HTML_TEMPLATE = """
                     <small style="display: block; margin-top: 5px; color: #666;">Duration for slow cooldown phase after print</small>
                 </div>
 
+                <div class="input-group">
+                    <label>Cooldown Target Temperature (<span id="cooldown-temp-unit">°C</span>)</label>
+                    <input type="number" id="cooldown-target-temp" value="21" min="0" max="50" step="0.5">
+                    <small style="display: block; margin-top: 5px; color: #666;">Target temperature for cooldown phase (default: 21°C / 70°F)</small>
+                </div>
+
                 <div class="toggle-switch" style="margin-top: 15px;">
                     <span>Require Preheat Confirmation</span>
                     <label class="switch">
@@ -1181,6 +1357,15 @@ HTML_TEMPLATE = """
                     </label>
                 </div>
                 <small style="display: block; margin-top: 5px; color: #666;">Wait for user confirmation after reaching target temperature before starting print timer</small>
+
+                <div class="toggle-switch" style="margin-top: 15px;">
+                    <span>Skip Preheat Phase</span>
+                    <label class="switch">
+                        <input type="checkbox" id="skip-preheat">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <small style="display: block; margin-top: 5px; color: #666;">Skip warming up phase and start print timer immediately</small>
             </div>
 
             <div class="settings-section">
@@ -1222,6 +1407,13 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
+    <!-- In-page Notification Toast -->
+    <div id="notification-overlay" class="notification-overlay" onclick="dismissNotification()"></div>
+    <div id="notification-toast" class="notification-toast" onclick="dismissNotification()">
+        <h3 id="notification-title">Notification</h3>
+        <p id="notification-body">Message here</p>
+    </div>
+
     <div class="grid">
         <!-- Status Card -->
         <div class="card">
@@ -1249,7 +1441,7 @@ HTML_TEMPLATE = """
                 <button class="button primary" id="start-btn" onclick="startPrint()">▶ START</button>
                 <button class="button secondary" id="pause-btn" onclick="pausePrint()" disabled>⏸ PAUSE</button>
                 <button class="button warning" id="stop-btn" onclick="stopPrint()" disabled>■ STOP</button>
-                <button class="button danger" onclick="emergencyStop()">⚠ EMERGENCY STOP</button>
+                <button class="button danger" id="emergency-stop-btn" onclick="emergencyStop()">⚠ EMERGENCY STOP</button>
             </div>
 
             <div class="toggle-switch">
@@ -1371,11 +1563,11 @@ HTML_TEMPLATE = """
 
     <script>
         let chart;
-        let notificationsEnabled = false;
         let tempUnit = 'C'; // Global temperature unit
         let sensorIds = []; // Store sensor IDs for renaming
         let previousPauseState = false; // Track pause state for notifications
         let previousAwaitingPreheat = false; // Track preheat confirmation state
+        let isFireAlarmActive = false; // Track fire alarm state to block controls
 
         // Temperature conversion functions
         function celsiusToFahrenheit(c) {
@@ -1423,8 +1615,14 @@ HTML_TEMPLATE = """
             const cooldownHours = localStorage.getItem('cooldownHours') || '4';
             document.getElementById('cooldown-hours').value = cooldownHours;
 
+            const cooldownTargetTemp = localStorage.getItem('cooldownTargetTemp') || '21';
+            document.getElementById('cooldown-target-temp').value = cooldownTargetTemp;
+
             const requirePreheatConfirmation = localStorage.getItem('requirePreheatConfirmation') === 'true';
             document.getElementById('require-preheat-confirmation').checked = requirePreheatConfirmation;
+
+            const skipPreheat = localStorage.getItem('skipPreheat') === 'true';
+            document.getElementById('skip-preheat').checked = skipPreheat;
 
             const savedTheme = localStorage.getItem('theme') || 'light';
             document.getElementById('dark-mode-toggle').checked = (savedTheme === 'dark');
@@ -1485,8 +1683,14 @@ HTML_TEMPLATE = """
             const cooldownHours = document.getElementById('cooldown-hours').value;
             localStorage.setItem('cooldownHours', cooldownHours);
 
+            const cooldownTargetTemp = document.getElementById('cooldown-target-temp').value;
+            localStorage.setItem('cooldownTargetTemp', cooldownTargetTemp);
+
             const requirePreheatConfirmation = document.getElementById('require-preheat-confirmation').checked;
             localStorage.setItem('requirePreheatConfirmation', requirePreheatConfirmation);
+
+            const skipPreheat = document.getElementById('skip-preheat').checked;
+            localStorage.setItem('skipPreheat', skipPreheat);
 
             // Collect probe names
             const probeNames = {};
@@ -1505,7 +1709,9 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({
                         hysteresis: parseFloat(hysteresis),
                         cooldown_hours: parseFloat(cooldownHours),
+                        cooldown_target_temp: parseFloat(cooldownTargetTemp),
                         require_preheat_confirmation: requirePreheatConfirmation,
+                        skip_preheat: skipPreheat,
                         probe_names: probeNames,
                         temp_unit: tempUnit
                     })
@@ -1547,6 +1753,12 @@ HTML_TEMPLATE = """
                 targetLabel.textContent = `Target Temperature (${unit})`;
             }
 
+            // Update cooldown target temp unit in settings modal
+            const cooldownTempUnit = document.getElementById('cooldown-temp-unit');
+            if (cooldownTempUnit) {
+                cooldownTempUnit.textContent = unit;
+            }
+
             // Update chart Y-axis label if chart exists
             if (chart) {
                 chart.options.scales.y.title.text = `Temperature (${unit})`;
@@ -1554,14 +1766,7 @@ HTML_TEMPLATE = """
             }
         }
 
-        // Request notification permission
-        if ('Notification' in window && Notification.permission === 'default') {
-            Notification.requestPermission().then(permission => {
-                notificationsEnabled = (permission === 'granted');
-            });
-        } else if ('Notification' in window && Notification.permission === 'granted') {
-            notificationsEnabled = true;
-        }
+        // In-page notifications are always enabled (no permission needed)
 
         // Theme Management
         function toggleTheme() {
@@ -1808,7 +2013,7 @@ HTML_TEMPLATE = """
         }
 
         async function emergencyStop() {
-            if (!confirm('Emergency stop will immediately halt all heating and cooling. Continue?')) {
+            if (!confirm('Emergency stop will immediately halt heater and fans. Continue?')) {
                 return;
             }
 
@@ -1824,6 +2029,14 @@ HTML_TEMPLATE = """
         }
 
         async function toggleHeater() {
+            // Block toggle during fire alarm
+            if (isFireAlarmActive) {
+                // Revert toggle to previous state
+                const toggle = document.getElementById('heater-toggle');
+                toggle.checked = !toggle.checked;
+                return;
+            }
+
             const state = document.getElementById('heater-toggle').checked;
             try {
                 const response = await fetch('/toggle_heater', {
@@ -1837,6 +2050,14 @@ HTML_TEMPLATE = """
         }
 
         async function toggleFans() {
+            // Block toggle during fire alarm
+            if (isFireAlarmActive) {
+                // Revert toggle to previous state
+                const toggle = document.getElementById('fans-toggle');
+                toggle.checked = !toggle.checked;
+                return;
+            }
+
             const state = document.getElementById('fans-toggle').checked;
             try {
                 const response = await fetch('/toggle_fans', {
@@ -1850,6 +2071,14 @@ HTML_TEMPLATE = """
         }
 
         async function toggleLights() {
+            // Block toggle during fire alarm
+            if (isFireAlarmActive) {
+                // Revert toggle to previous state
+                const toggle = document.getElementById('lights-toggle');
+                toggle.checked = !toggle.checked;
+                return;
+            }
+
             const state = document.getElementById('lights-toggle').checked;
             try {
                 const response = await fetch('/toggle_lights', {
@@ -1892,13 +2121,51 @@ HTML_TEMPLATE = """
             window.open('/download_log', '_blank');
         }
 
+        let notificationTimeout = null;
+
         function showNotification(title, body, isUrgent = false) {
-            if (notificationsEnabled) {
-                new Notification(title, {
-                    body: body,
-                    icon: '🔥',
-                    requireInteraction: isUrgent
-                });
+            // Clear any existing notification timeout
+            if (notificationTimeout) {
+                clearTimeout(notificationTimeout);
+            }
+
+            // Update notification content
+            document.getElementById('notification-title').textContent = title;
+            document.getElementById('notification-body').textContent = body;
+
+            // Show notification and overlay
+            const toast = document.getElementById('notification-toast');
+            const overlay = document.getElementById('notification-overlay');
+
+            toast.classList.remove('hiding');
+            toast.style.display = 'block';
+            overlay.style.display = 'block';
+
+            // Auto-dismiss after delay (longer for urgent notifications)
+            const dismissDelay = isUrgent ? 5000 : 3000;
+            notificationTimeout = setTimeout(() => {
+                dismissNotification();
+            }, dismissDelay);
+        }
+
+        function dismissNotification() {
+            const toast = document.getElementById('notification-toast');
+            const overlay = document.getElementById('notification-overlay');
+
+            // Add hiding animation
+            toast.classList.add('hiding');
+
+            // Hide after animation completes
+            setTimeout(() => {
+                toast.style.display = 'none';
+                overlay.style.display = 'none';
+                toast.classList.remove('hiding');
+            }, 300); // Match animation duration
+
+            // Clear timeout
+            if (notificationTimeout) {
+                clearTimeout(notificationTimeout);
+                notificationTimeout = null;
             }
         }
 
@@ -1985,12 +2252,93 @@ HTML_TEMPLATE = """
                     // Fire alert
                     const alert = document.getElementById('fire-alert');
                     const resetBtn = document.getElementById('reset-btn');
+                    const emergencyStopBtn = document.getElementById('emergency-stop-btn');
+                    const heaterToggle = document.getElementById('heater-toggle');
+                    const fansToggle = document.getElementById('fans-toggle');
+                    const lightsToggle = document.getElementById('lights-toggle');
+                    const settingsBtn = document.getElementById('settings-btn');
+
                     if (data.emergency_stop) {
+                        isFireAlarmActive = true; // Set global flag
                         alert.style.display = 'block';
                         resetBtn.disabled = false;
+
+                        // Disable ALL controls except reset button during fire alarm
+                        startBtn.disabled = true;
+                        pauseBtn.disabled = true;
+                        stopBtn.disabled = true;
+                        emergencyStopBtn.disabled = true;
+                        settingsBtn.disabled = true;
+                        heaterToggle.disabled = true;
+                        fansToggle.disabled = true;
+                        lightsToggle.disabled = true;
+
+                        // Disable configuration inputs
+                        document.getElementById('target-temp').disabled = true;
+                        document.getElementById('print-hours').disabled = true;
+                        document.getElementById('print-minutes').disabled = true;
+                        document.getElementById('fans-enabled').disabled = true;
+                        document.getElementById('logging-enabled').disabled = true;
+
+                        // Disable time adjustment buttons
+                        const timeAdjustButtons = document.querySelectorAll('.time-adjust button');
+                        timeAdjustButtons.forEach(btn => {
+                            btn.disabled = true;
+                            btn.style.opacity = '0.4';
+                        });
+
+                        // Disable preset buttons
+                        const presetItems = document.querySelectorAll('.preset-item');
+                        presetItems.forEach(item => {
+                            item.style.pointerEvents = 'none';
+                            item.style.opacity = '0.4';
+                        });
+
+                        // Add visual indication that controls are locked
+                        startBtn.style.opacity = '0.4';
+                        pauseBtn.style.opacity = '0.4';
+                        stopBtn.style.opacity = '0.4';
+                        emergencyStopBtn.style.opacity = '0.4';
                     } else {
+                        isFireAlarmActive = false; // Clear global flag
                         alert.style.display = 'none';
                         resetBtn.disabled = true;
+
+                        // Re-enable controls when fire alarm is cleared
+                        emergencyStopBtn.disabled = false;
+                        settingsBtn.disabled = false;
+                        heaterToggle.disabled = false;
+                        fansToggle.disabled = false;
+                        lightsToggle.disabled = false;
+
+                        // Re-enable configuration inputs
+                        document.getElementById('target-temp').disabled = false;
+                        document.getElementById('print-hours').disabled = false;
+                        document.getElementById('print-minutes').disabled = false;
+                        document.getElementById('fans-enabled').disabled = false;
+                        document.getElementById('logging-enabled').disabled = false;
+
+                        // Re-enable time adjustment buttons
+                        const timeAdjustButtons = document.querySelectorAll('.time-adjust button');
+                        timeAdjustButtons.forEach(btn => {
+                            btn.disabled = false;
+                            btn.style.opacity = '1';
+                        });
+
+                        // Re-enable preset buttons
+                        const presetItems = document.querySelectorAll('.preset-item');
+                        presetItems.forEach(item => {
+                            item.style.pointerEvents = 'auto';
+                            item.style.opacity = '1';
+                        });
+
+                        // Restore normal opacity
+                        startBtn.style.opacity = '1';
+                        pauseBtn.style.opacity = '1';
+                        stopBtn.style.opacity = '1';
+                        emergencyStopBtn.style.opacity = '1';
+
+                        // START, PAUSE, STOP buttons already handled by print_active logic above
                     }
 
                     // Update sensor list with proper temperature formatting
@@ -2104,10 +2452,14 @@ def save_advanced_settings():
         current_settings['hysteresis'] = data['hysteresis']
     if 'cooldown_hours' in data:
         current_settings['cooldown_hours'] = data['cooldown_hours']
+    if 'cooldown_target_temp' in data:
+        current_settings['cooldown_target_temp'] = data['cooldown_target_temp']
     if 'temp_unit' in data:
         current_settings['temp_unit'] = data['temp_unit']
     if 'require_preheat_confirmation' in data:
         current_settings['require_preheat_confirmation'] = data['require_preheat_confirmation']
+    if 'skip_preheat' in data:
+        current_settings['skip_preheat'] = data['skip_preheat']
     if 'probe_names' in data:
         current_settings['probe_names'] = data['probe_names']
         # Update probe locations immediately
