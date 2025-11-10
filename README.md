@@ -27,6 +27,7 @@ A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber
 - ✅ **Preheat Confirmation** - Optional wait for user approval to start print
 - 🔐 **Fire Alarm Lockdown** - All controls disabled during fire emergency
 - 🔄 **GPIO State Sync** - Detects hardware state on service restart
+- 💾 **Crash Recovery** - Resume interrupted prints after crashes or restarts
 
 ## Quick Start
 
@@ -206,6 +207,7 @@ Complete setup guides are available in project documentation.
 - **Sensor Redundancy**: Continues with partial sensor failures
 - **Gradual Cooldown**: Prevents thermal shock to printer/chamber
 - **Auto-Recovery**: Service restarts automatically if crashed
+- **State Persistence**: Resume interrupted prints after crashes with exact timing preserved
 
 ## Temperature Logging
 
@@ -320,10 +322,12 @@ x1c_controller/
 ├── x1c_heater.py           # Main application
 ├── requirements.txt         # Python dependencies
 ├── heater_settings.json    # Auto-generated settings
+├── print_state.json        # Crash recovery state (auto-generated)
 ├── README.md               # This file
 ├── CLAUDE.md               # Technical documentation
 ├── SERVICE_MANAGEMENT.md   # Service management guide
 ├── TODO.md                 # Future improvements
+├── WIREGUARD_SETUP.md      # VPN setup guide
 └── venv/                   # Virtual environment
 ```
 
@@ -362,6 +366,6 @@ Contributions welcome! Please:
 
 ---
 
-**Version**: 2.4 (WebSocket Implementation)
-**Status**: In Testing ⚠️ (Known UI flickering issue - see TODO.md)
-**Last Updated**: 2025-11-08
+**Version**: 2.6 (Print State Persistence & Crash Recovery)
+**Status**: Production Ready ✅
+**Last Updated**: 2025-11-09
