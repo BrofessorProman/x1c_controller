@@ -44,9 +44,9 @@ The system requires:
 - **DS18B20 temperature sensors**: Multiple probes for averaging chamber temperature (1-Wire interface required)
 - **SSR relay**: GPIO pin 17 controls heater power
 - **MQ-2 fire sensor**: GPIO pin 18 for fire detection (active LOW - triggers when pin goes LOW)
+- **Lights relay**: GPIO pin 22 for independent lights control
 - **Buzzer**: GPIO pin 27 for fire alarm
 - **Filtration fans**: GPIO pins 23 and 24
-- **USB lights control**: Either via uhubctl (GPIO pin 22 if using relay - see TODO.md)
 
 ## Software Dependencies
 
@@ -58,11 +58,6 @@ pip install -r requirements.txt
 Or manually:
 ```bash
 pip install w1thermsensor simple-pid RPi.GPIO Flask
-```
-
-System dependency for USB control (optional):
-```bash
-sudo apt install uhubctl
 ```
 
 Enable 1-Wire interface:
@@ -303,7 +298,7 @@ After cooldown, system returns to IDLE and waits for next START command.
 ```
 GPIO 17 → SSR relay (heater control)
 GPIO 18 → MQ-2 digital output (fire detection, active LOW)
-GPIO 22 → Optional: Lights relay (if not using uhubctl)
+GPIO 22 → Lights relay
 GPIO 27 → Buzzer (alarm)
 GPIO 23 → Filtration fan 1
 GPIO 24 → Filtration fan 2
@@ -319,10 +314,8 @@ Located at top of `x1c_heater.py`:
 - `COOLDOWN_HOURS = 4` - Default slow cooldown duration in hours (user-configurable via settings menu)
 - `COOLDOWN_STEP_INTERVAL = 300` - Cooldown step interval (5 minutes)
 - `SETTINGS_FILE = 'heater_settings.json'` - Settings persistence file
+- `PRINT_STATE_FILE = 'print_state.json'` - Print state persistence for crash recovery
 - `MAX_HISTORY = 1000` - Maximum temperature history data points
-- `USB_HUB_LOCATION = '1-1'` - USB hub location for uhubctl
-- `USB_HUB_PORT = '2'` - USB port number for lights
-- `USB_CONTROL_ENABLED = True` - Enable/disable USB control
 
 ## API Endpoints
 
@@ -431,19 +424,14 @@ When user toggles heater/fans via web interface:
   - Presets array
 - Note: `heater_settings.json` is excluded from git (contains user-specific configuration)
 
-### USB Light Control Options
+### Lights Control
 
-**Option 1: uhubctl (Current default)**
-- Configure `USB_HUB_LOCATION` and `USB_HUB_PORT` in x1c_heater.py
-- Run `sudo uhubctl` to find your hub/port configuration
-- May require sudo or udev rules for permissions
-- Set `USB_CONTROL_ENABLED = False` to disable if not needed
-
-**Option 2: Relay (Recommended - See TODO.md)**
-- Add relay on GPIO pin 22
-- More reliable than uhubctl
-- No USB hub configuration needed
-- Simple on/off control like heater relay
+The system uses a relay on GPIO pin 22 for independent lights control:
+- **Simple toggle**: User can turn lights on/off at any time via web interface
+- **State persistence**: Lights state saved to `heater_settings.json`
+- **Crash recovery**: Lights restore to last saved state after restart
+- **Independent operation**: Lights remain on/off regardless of program phase (heating, cooling, emergency stop, etc.)
+- **GPIO state detection**: On startup, syncs hardware state with saved preference
 
 ### Browser Compatibility
 - Tested on modern Chrome, Firefox, Safari, Edge
@@ -571,16 +559,20 @@ sudo raspi-config
 # Interface Options → 1-Wire → Enable
 ```
 
-### USB Light Control Fails
+### Lights Relay Not Working
 ```bash
-# Option 1: Configure uhubctl
-sudo uhubctl  # Find your hub/port
-# Update USB_HUB_LOCATION and USB_HUB_PORT in code
+# Check if relay is connected to GPIO 22 (Physical Pin 15)
+# Verify wiring:
+# - Relay signal pin → GPIO 22
+# - Relay VCC → 5V or 3.3V (depending on relay)
+# - Relay GND → Ground
 
-# Option 2: Disable USB control
-# Set USB_CONTROL_ENABLED = False in x1c_heater.py
+# Test GPIO output manually
+gpio -g write 22 1  # Turn on
+gpio -g write 22 0  # Turn off
 
-# Option 3: Use relay instead (see TODO.md)
+# Check logs for errors
+sudo journalctl -u x1c-heater.service -n 50 | grep -i light
 ```
 
 ## Remote Access Security
@@ -643,7 +635,27 @@ See `TODO.md` for planned improvements including:
 
 ## Version History
 
-**Current Version**: 2.6 (Print State Persistence & Crash Recovery)
+**Current Version**: 2.7 (Lights Relay Implementation)
+- **NEW**: GPIO-based lights relay on pin 22 (Physical Pin 15)
+  - Direct GPIO control replaces unreliable uhubctl USB hub control
+  - Simple on/off relay operation for lights
+  - More reliable and consistent than USB hub power switching
+- **NEW**: Independent lights operation
+  - Lights remain on/off regardless of program phase (heating, cooling, emergency stop, shutdown)
+  - User has full manual control via web interface toggle
+  - Lights maintain state during emergency stop and system shutdown
+- **IMPROVED**: Lights state persistence and recovery
+  - State saved to `heater_settings.json` (lights_enabled field)
+  - GPIO state detection on startup syncs hardware with saved preference
+  - Lights restore to last saved state after service restart or crash
+- **REMOVED**: All uhubctl USB hub control logic
+  - Deleted `USB_HUB_LOCATION`, `USB_HUB_PORT`, `USB_CONTROL_ENABLED` constants
+  - Removed `get_usb_power_status()` function
+  - Renamed `set_usb_power()` to `set_lights()` for clarity
+  - Removed uhubctl from software dependencies
+- All features from version 2.6 and earlier
+
+**Version 2.6**: (Print State Persistence & Crash Recovery)
 - **NEW**: Comprehensive print state persistence system
   - Automatically saves print state every 10 seconds during heating/maintaining phases
   - Saves state every 5 minutes during cooldown phase

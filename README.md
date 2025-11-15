@@ -45,7 +45,7 @@ A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber
 ```
 GPIO 17 → SSR Relay (Heater)
 GPIO 18 → MQ-2 Sensor (Fire Detection)
-GPIO 22 → Lights Relay (optional)
+GPIO 22 → Lights Relay
 GPIO 23 → Fan 1 Relay
 GPIO 24 → Fan 2 Relay
 GPIO 27 → Buzzer
@@ -74,10 +74,10 @@ sudo raspi-config
 
 ### 3. Configuration
 
-Edit `x1c_heater.py` to configure:
-- USB hub settings (if using uhubctl for lights)
+Edit `x1c_heater.py` to configure (optional):
 - PID tuning parameters
 - Default temperatures
+- Hysteresis and cooldown settings
 
 ### 4. Test Run
 
@@ -277,7 +277,7 @@ Edit these constants in `x1c_heater.py`:
 HYSTERESIS = 2.0              # Temperature band (°C)
 TEMP_UPDATE_INTERVAL = 5      # Update frequency (seconds)
 COOLDOWN_HOURS = 4            # Cooldown duration (hours)
-USB_CONTROL_ENABLED = True    # Enable/disable USB light control
+COOLDOWN_STEP_INTERVAL = 300  # Cooldown step interval (seconds)
 ```
 
 ## Default Presets
@@ -366,6 +366,6 @@ Contributions welcome! Please:
 
 ---
 
-**Version**: 2.6 (Print State Persistence & Crash Recovery)
+**Version**: 2.7 (Lights Relay Implementation)
 **Status**: Production Ready ✅
-**Last Updated**: 2025-11-09
+**Last Updated**: 2025-11-15

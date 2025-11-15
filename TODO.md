@@ -77,39 +77,45 @@
 
 ## Hardware To-Do
 
-### ⚡ Add Relay for USB Lights Control
+(No pending hardware tasks)
+
+---
+
+## ✅ Completed Hardware Tasks
+
+### ✅ COMPLETED: GPIO-Based Lights Relay Implementation
 **Priority:** Medium
-**Status:** Not Started
+**Status:** Completed (2025-11-15)
 
-**Current Issue:**
-- USB hub control via uhubctl is not working reliably
-- Cannot identify correct hub/port for USB lights
+**Original Issue:**
+- USB hub control via uhubctl was not working reliably
+- Could not identify correct hub/port for USB lights
 
-**Solution:**
-- Add a relay module to control USB lights power
-- Connect relay to available GPIO pin (suggestion: GPIO 22)
-- Similar to heater relay setup (SSR on GPIO 17)
+**Solution Implemented:**
+- Added relay module on GPIO pin 22 (Physical Pin 15) for lights control
+- Simple on/off GPIO control replaces unreliable uhubctl
+- Lights operate independently of all program phases
 
-**Parts Needed:**
-- [ ] 5V relay module (or reuse existing relay if available)
-- [ ] Jumper wires
-- [ ] USB cable with power wire accessible for relay switching
+**Hardware:**
+- ✅ 5V relay module connected to GPIO 22
+- ✅ Relay wiring completed (signal, VCC, GND)
 
-**Code Changes Required:**
-- [ ] Add `LIGHTS_RELAY_PIN = 22` to pin configuration
-- [ ] Update `GPIO.setup(LIGHTS_RELAY_PIN, GPIO.OUT)` in setup
-- [ ] Replace `set_usb_power()` calls with `GPIO.output(LIGHTS_RELAY_PIN, HIGH/LOW)`
-- [ ] Remove uhubctl dependency
+**Code Changes Completed:**
+- ✅ Added `LIGHTS_PIN = 22` to pin configuration
+- ✅ Added `GPIO.setup(LIGHTS_PIN, GPIO.OUT)` in setup
+- ✅ Created `set_lights()` function for GPIO control
+- ✅ Removed all uhubctl dependencies and logic
+- ✅ Removed `USB_HUB_LOCATION`, `USB_HUB_PORT`, `USB_CONTROL_ENABLED` constants
+- ✅ Removed `get_usb_power_status()` function
+- ✅ Added GPIO state detection on startup
+- ✅ Implemented state persistence to heater_settings.json
+- ✅ Lights maintain state during shutdown (not forced OFF)
 
-**Wiring:**
-```
-GPIO 22 → Relay Signal Pin
-Relay VCC → 5V Pin
-Relay GND → Ground Pin
-Relay NO/COM → USB Power Wire (cut and insert relay)
-```
-
-**Estimated Time:** 30 minutes
+**Features:**
+- Independent operation (lights unaffected by print phases, emergency stop, or shutdown)
+- User has full manual control via web interface toggle
+- State persists across restarts and crashes
+- GPIO state detection syncs hardware with saved preference
 
 ---
 
@@ -641,4 +647,4 @@ Transform the current fixed-layout dashboard into a flexible, user-customizable 
 
 ---
 
-**Last Updated:** 2025-11-09
+**Last Updated:** 2025-11-15

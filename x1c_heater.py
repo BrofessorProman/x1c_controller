@@ -22,15 +22,10 @@ SETTINGS_FILE = 'heater_settings.json'
 PRINT_STATE_FILE = 'print_state.json'  # Persists print cycle state for crash recovery
 LOG_FILE = 'temperature_log.csv'
 
-# USB Hub Configuration (adjust for your Raspberry Pi)
-# Run 'sudo uhubctl' to find your hub location and port number
-USB_HUB_LOCATION = '1-1'  # Common for RPi 4, may be '1-1.1' or different on other models
-USB_HUB_PORT = '2'        # Port number where USB lights are connected
-USB_CONTROL_ENABLED = True  # Set to False to disable USB control if not needed/supported
-
 # Pin Setup
 RELAY_PIN = 17   # SSR control
 FIRE_PIN = 18    # MQ-2 DO
+LIGHTS_PIN = 22  # Lights relay
 BUZZER_PIN = 27  # Buzzer
 FAN1_PIN = 23    # Filtration fan 1
 FAN2_PIN = 24    # Filtration fan 2
@@ -38,6 +33,7 @@ FAN2_PIN = 24    # Filtration fan 2
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(RELAY_PIN, GPIO.OUT)
 GPIO.setup(FIRE_PIN, GPIO.IN)
+GPIO.setup(LIGHTS_PIN, GPIO.OUT)
 GPIO.setup(BUZZER_PIN, GPIO.OUT)
 GPIO.setup(FAN1_PIN, GPIO.OUT)
 GPIO.setup(FAN2_PIN, GPIO.OUT)
@@ -47,6 +43,7 @@ GPIO.setup(FAN2_PIN, GPIO.OUT)
 startup_heater_state = GPIO.input(RELAY_PIN)
 startup_fan1_state = GPIO.input(FAN1_PIN)
 startup_fan2_state = GPIO.input(FAN2_PIN)
+startup_lights_state = GPIO.input(LIGHTS_PIN)
 
 # Global state flags and variables
 emergency_stop = False
@@ -55,17 +52,19 @@ fans_on = bool(startup_fan1_state or startup_fan2_state)  # Set based on actual 
 fans_manual_override = False
 heater_on = bool(startup_heater_state)  # Set based on actual GPIO state
 heater_manual_override = False
+lights_on = bool(startup_lights_state)  # Set based on actual GPIO state
 
 # Log detected startup states
-if heater_on or fans_on:
+if heater_on or fans_on or lights_on:
     print("="*50)
     print("GPIO State Detected on Startup:")
     if heater_on:
         print("  ⚠️  Heater was ON - syncing state")
     if fans_on:
         print("  ⚠️  Fans were ON - syncing state")
+    if lights_on:
+        print("  ⚠️  Lights were ON - syncing state")
     print("="*50)
-lights_on = False
 print_active = False
 print_paused = False
 warmup_complete = False
@@ -344,74 +343,25 @@ if resume_state:
     status_data['pending_resume'] = True
     print("Waiting for user to confirm resume or abort...")
 
-# USB Lights Control
-def get_usb_power_status():
-    """Check current USB power status"""
-    if not USB_CONTROL_ENABLED:
-        return False
-
+# Lights Control
+def set_lights(on_off):
+    """Control lights relay via GPIO pin 22"""
     try:
-        result = subprocess.run(['uhubctl'], capture_output=True, text=True, timeout=5)
-        # Look for the configured hub location
-        hub_line = f'Current status for hub {USB_HUB_LOCATION}'
-        if hub_line in result.stdout:
-            # Parse the output to check port status
-            lines = result.stdout.split('\n')
-            for line in lines:
-                if f'Port {USB_HUB_PORT}:' in line and 'power' in line.lower():
-                    # Port is powered if status contains '0x0503' or similar power-on code
-                    return '0503' in line or '0x0503' in line
-        return False
-    except FileNotFoundError:
-        print("WARNING: uhubctl not found. Install with: sudo apt install uhubctl")
-        print("USB light control will be disabled.")
-        return False
-    except (subprocess.TimeoutExpired, Exception) as e:
-        print(f"WARNING: USB power status check failed: {e}")
-        return False
-
-def set_usb_power(on_off):
-    """Control USB hub power"""
-    if not USB_CONTROL_ENABLED:
-        print("USB control is disabled in configuration")
-        return False
-
-    try:
-        action = '1' if on_off else '0'
-        result = subprocess.run(
-            ['uhubctl', '-l', USB_HUB_LOCATION, '-p', USB_HUB_PORT, '-a', action],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False  # Don't raise exception, we'll check manually
-        )
-
-        if result.returncode != 0:
-            print(f"WARNING: uhubctl command failed (exit code {result.returncode})")
-            print(f"stdout: {result.stdout}")
-            print(f"stderr: {result.stderr}")
-            print(f"\nTroubleshooting:")
-            print(f"1. Run 'sudo uhubctl' on your Raspberry Pi to find correct hub/port")
-            print(f"2. Update USB_HUB_LOCATION (currently '{USB_HUB_LOCATION}') and USB_HUB_PORT (currently '{USB_HUB_PORT}')")
-            print(f"3. Try running with sudo if permission denied")
-            print(f"4. Set USB_CONTROL_ENABLED = False if USB control not needed/supported")
-            return False
-
+        GPIO.output(LIGHTS_PIN, GPIO.HIGH if on_off else GPIO.LOW)
+        print(f"Lights relay turned {'ON' if on_off else 'OFF'}")
         return True
-
-    except FileNotFoundError:
-        print("ERROR: uhubctl not found. Install with: sudo apt install uhubctl")
-        print("Or set USB_CONTROL_ENABLED = False to disable USB control")
-        return False
-    except (subprocess.TimeoutExpired, Exception) as e:
-        print(f"WARNING: USB power control failed: {e}")
+    except Exception as e:
+        print(f"WARNING: Lights relay control failed: {e}")
         return False
 
 # Initialize lights based on saved settings
-lights_on = current_settings.get('lights_enabled', True)
-if lights_on:
-    set_usb_power(True)
-    print("USB lights turned on (from saved settings)")
+# (lights_on already set from GPIO state detection above)
+saved_lights_state = current_settings.get('lights_enabled', True)
+if saved_lights_state != lights_on:
+    # Sync hardware with saved preference
+    set_lights(saved_lights_state)
+    lights_on = saved_lights_state
+    print(f"Lights set to {'ON' if saved_lights_state else 'OFF'} (from saved settings)")
 status_data['lights_on'] = lights_on
 
 # Fire Monitor with Web Reset
@@ -3568,7 +3518,7 @@ def toggle_lights():
 
     with state_lock:
         lights_on = state
-        set_usb_power(state)
+        set_lights(state)
         status_data['lights_on'] = state
         current_settings['lights_enabled'] = state
         save_settings(current_settings)
@@ -3646,11 +3596,11 @@ except KeyboardInterrupt:
     print("\n\nKeyboard interrupt received. Shutting down safely...")
     shutdown_requested = True
 finally:
-    # Cleanup
+    # Cleanup - turn off heater, fans, and buzzer
+    # Note: Lights maintain their current state
     GPIO.output(RELAY_PIN, GPIO.LOW)
     GPIO.output(FAN1_PIN, GPIO.LOW)
     GPIO.output(FAN2_PIN, GPIO.LOW)
     GPIO.output(BUZZER_PIN, GPIO.LOW)
     GPIO.cleanup()
-    set_usb_power(False)
     print("System shutdown complete.")
