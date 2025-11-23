@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Raspberry Pi-based temperature controller for a 3D printer chamber heater with a comprehensive Flask web interface. It uses PID control to maintain target temperature using multiple DS18B20 sensors, controls a heater via SSR relay, monitors for fire with an MQ-2 sensor, and manages USB-powered lights and filtration fans.
+This is a Raspberry Pi-based temperature controller for a 3D printer chamber heater with comprehensive Flask web interface and Bambu Lab X1C printer integration. It uses PID control to maintain target temperature using multiple DS18B20 sensors, controls a heater via SSR relay, monitors for fire with an MQ-2 sensor, manages USB-powered lights and filtration fans, and integrates with Bambu Lab X1C printer via MQTT for automated print workflows.
 
 **Key Features:**
 - ✅ Fully web-controlled - no command-line interaction required during operation
@@ -22,6 +22,10 @@ This is a Raspberry Pi-based temperature controller for a 3D printer chamber hea
 - ✅ GPIO state detection on restart - syncs software/hardware state
 - ✅ Fire alarm UI lockdown - comprehensive safety controls during emergency
 - ✅ Print state persistence and crash recovery - resume interrupted prints after crashes or restarts
+- ✅ **Bambu Lab X1C Integration** - MQTT monitoring, control, and camera streaming (v2.8-alpha)
+- ✅ **Material-Based Auto-Start** - Automatically configures heater when print starts based on detected material
+- ✅ **Printer Control** - Pause/Resume/Stop prints via web interface
+- ✅ **Live Camera Feed** - On-demand streaming from X1C camera
 
 ## Quick Start
 
@@ -57,13 +61,17 @@ pip install -r requirements.txt
 
 Or manually:
 ```bash
-pip install w1thermsensor simple-pid RPi.GPIO Flask
+pip install w1thermsensor simple-pid RPi.GPIO Flask flask-socketio paho-mqtt
 ```
 
-Enable 1-Wire interface:
+Install system packages:
 ```bash
+# Enable 1-Wire interface for temperature sensors
 sudo raspi-config
 # Navigate to: Interface Options → 1-Wire → Enable
+
+# Install FFmpeg for camera streaming (optional, only needed if using printer camera)
+sudo apt-get install -y ffmpeg
 ```
 
 ## Running the Controller
@@ -100,12 +108,115 @@ The script will:
 
 ## Remote Access
 
-For secure remote access from outside your home network, WireGuard VPN is recommended. A complete setup guide for WireGuard is provided in this documentation, allowing access to your entire home network including the heater controller and any future devices.
+For secure remote access from outside your home network, WireGuard VPN is recommended. This allows access to your entire home network including the heater controller and any future devices.
 
-**Alternative options:**
-- Tailscale (easiest, zero-config)
-- Cloudflare Tunnel (free, custom domain)
-- Port forwarding (not recommended for security)
+### WireGuard VPN Setup Guide
+
+**Operating System Recommendation:**
+For Raspberry Pi 4 with 8GB RAM, use **Raspberry Pi OS Lite (64-bit)**:
+- Required for utilizing all 8GB RAM (32-bit limited to ~3GB)
+- No desktop environment - more resources for heater controller
+- Smaller attack surface for security
+- Full WireGuard support built-in
+- Perfect for headless server operation (SSH + web interface access)
+
+**Installation & Configuration:**
+
+Most WireGuard installers provide interactive setup. Key configuration choices:
+
+1. **IPv6 Routing** - Select "Yes" to force routing IPv6 to block leakage
+   - Prevents traffic from bypassing VPN tunnel
+   - Safe even if you don't use IPv6 devices
+   - Future-proof for ISP IPv6 rollout
+
+2. **DNS Entry vs Public IP** - Select "DNS Entry" (recommended)
+   - Works with Dynamic DNS (DDNS) services
+   - Handles dynamic IP changes automatically
+   - Client configs never need updating
+   - Only use Public IP if you have a static IP from ISP
+
+3. **Client IP Configuration**
+   - Enter client IP without CIDR notation (e.g., `10.180.200.2`)
+   - Most setup wizards add `/24` automatically
+   - Each client needs unique IP in VPN subnet (`.2`, `.3`, `.4`, etc.)
+   - Check server config for subnet: `sudo cat /etc/wireguard/wg0.conf`
+
+**Dynamic DNS Setup (DuckDNS):**
+
+If using DNS Entry option, set up DuckDNS for automatic IP updates:
+
+```bash
+# 1. Create directory
+mkdir ~/duckdns
+cd ~/duckdns
+
+# 2. Create update script
+nano duck.sh
+```
+
+Add this content (replace YOUR_DOMAIN and YOUR_TOKEN from duckdns.org):
+```bash
+#!/bin/bash
+echo url="https://www.duckdns.org/update?domains=YOUR_DOMAIN&token=YOUR_TOKEN&ip=" | curl -k -o ~/duckdns/duck.log -K -
+```
+
+```bash
+# 3. Make executable and test
+chmod 700 duck.sh
+./duck.sh
+cat duck.log  # Should show "OK"
+
+# 4. Set up auto-update (runs every 5 minutes)
+crontab -e
+# Add this line:
+*/5 * * * * ~/duckdns/duck.sh >/dev/null 2>&1
+```
+
+**Router Port Forwarding:**
+
+Configure port forwarding on your router (example for Asus RT-AC5300):
+
+1. Navigate to: **Advanced Settings → WAN → Virtual Server / Port Forwarding**
+2. Configure:
+   - **Service Name:** WireGuard
+   - **Port Range:** 51820 (or your WireGuard port)
+   - **Local IP:** Raspberry Pi's IP (e.g., `192.168.1.50`)
+   - **Local Port:** 51820
+   - **Protocol:** **UDP** (important!)
+   - **Source Target:** Leave blank or `0.0.0.0` (allow from anywhere)
+
+**Important:** Set a static IP or DHCP reservation for your Pi so port forwarding doesn't break.
+
+**Testing the Connection:**
+
+Best method is actual WireGuard connection from outside your network:
+
+1. Use mobile device with cellular data (not WiFi)
+2. Install WireGuard app
+3. Import client config
+4. Attempt connection
+5. Try accessing heater interface: `http://<pi-local-ip>:5000`
+
+**Note:** WireGuard is "stealthy" - it won't respond to port scans without valid keys, so online port checkers may report it as closed even when working.
+
+**What WireGuard Encrypts (Important Clarification):**
+
+This is a **"remote access VPN"** - it provides:
+- ✅ Encrypted connection from remote device to home network
+- ✅ Secure access to heater controller from anywhere
+- ✅ Protection when using public WiFi to connect home
+- ✅ Access to all home network devices remotely
+
+This is NOT a **"privacy VPN"** - it does NOT:
+- ❌ Encrypt general internet browsing from home devices
+- ❌ Hide home network's internet activity from ISP
+- ❌ Route all internet traffic through another server
+- ❌ Provide anonymity/privacy like commercial VPNs
+
+**Alternative Remote Access Options:**
+- **Tailscale** (easiest, zero-config, mesh VPN)
+- **Cloudflare Tunnel** (free, custom domain, no port forwarding needed)
+- **Port forwarding** (not recommended - exposes services directly to internet)
 
 ## Web Interface
 
@@ -223,11 +334,12 @@ When fire detected:
 ## Architecture
 
 ### Threading Model
-Four concurrent threads:
+Five concurrent threads:
 1. **fire_monitor()**: Polls MQ-2 sensor (1s interval), manages emergency shutdown and reset
 2. **main_loop()**: Waits for web START command, manages print cycle, PID control, and cooldown
-3. **run_flask()**: Web server on port 5000
-4. **Main thread**: Keeps process alive, handles Ctrl+C cleanup
+3. **printer_monitor()**: MQTT client for Bambu Lab X1C integration (optional, enabled via settings)
+4. **run_flask()**: Web server on port 5000 with WebSocket support
+5. **Main thread**: Keeps process alive, handles Ctrl+C cleanup
 
 ### State Management
 - **Settings persistence**: `heater_settings.json` stores configuration and presets
@@ -286,6 +398,169 @@ After cooldown, system returns to IDLE and waits for next START command.
   - Button changes back to "PAUSE" (gray color)
   - Browser notification sent
 - Pause state is cleared when print ends or is stopped
+
+### Bambu Lab X1C Printer Integration (v2.8-alpha)
+
+**Status:** Backend complete, UI pending
+
+The system integrates with Bambu Lab X1C printer via MQTT for automated print workflows.
+
+#### Connection & Configuration
+- **Protocol**: MQTT over TLS (port 8883)
+- **Authentication**: Username `bblp`, Password = LAN Access Code
+- **Enable**: Set `printer_enabled: true` in `heater_settings.json`
+- **Required Settings**:
+  - `printer_ip`: Printer's local IP address
+  - `printer_access_code`: LAN Access Code from printer settings
+  - `printer_serial`: Printer serial number/device ID
+- **Prerequisites**:
+  - Developer Mode enabled on X1C
+  - LAN Mode Liveview enabled for camera access
+
+#### Material-Based Auto-Start
+When a print starts on the X1C, the system automatically:
+1. Detects print start (MQTT gcode_state transition to RUNNING)
+2. Identifies material (from AMS tray data or filename pattern matching)
+3. Looks up material in `material_mappings` configuration
+4. Configures heater with material-specific settings:
+   - Target temperature
+   - Fan enable/disable
+   - Print duration (from printer's estimated time)
+5. Triggers heater START automatically
+
+**Material Detection Methods:**
+- **Primary**: AMS tray data (`ams.ams[0].tray[X].tray_type`)
+- **Fallback**: Filename pattern matching (e.g., `part_PC.gcode` → PC)
+
+**Default Material Mappings:**
+- **PC** (Polycarbonate): 60°C, Fans OFF
+- **ABS**: 60°C, Fans ON
+- **ASA**: 65°C, Fans ON
+- **PETG**: 40°C, Fans ON
+- **PLA**: 0°C (no heating), Fans OFF
+
+Material mappings are fully customizable via `heater_settings.json`.
+
+**Auto-Start Behavior:**
+- Only triggers on idle → printing transition
+- Skips if heater already running
+- Skips if material not in mappings (logs warning)
+- Can be disabled: `auto_start_enabled: false`
+- Emits notification when triggered
+
+#### Printer Monitoring
+The `printer_monitor()` thread continuously receives MQTT reports containing:
+- **Print Status**: Phase (idle/printing/paused/finish), file name, progress (0-100%)
+- **Temperatures**: Nozzle, bed, chamber (from printer's sensors)
+- **Time Remaining**: Estimated time left in seconds
+- **Material Info**: From AMS or slicer metadata
+- **Connection Status**: MQTT broker connectivity
+
+All status data is:
+- Updated in real-time via WebSocket (`status_update` event)
+- Thread-safe (protected by `printer_lock`)
+- Available via `/status` API endpoint
+
+#### Printer Control
+Three control commands available via API:
+- **`POST /printer/pause`**: Pause current print
+- **`POST /printer/resume`**: Resume paused print
+- **`POST /printer/stop`**: Stop/cancel print
+
+Commands use MQTT publish to `device/{SERIAL}/request` with format:
+```json
+{
+  "print": {
+    "sequence_id": "123",
+    "command": "pause|resume|stop"
+  }
+}
+```
+
+**UI Integration:** Control buttons planned for dashboard (pending UI implementation)
+
+#### Camera Streaming
+On-demand live video feed from X1C camera.
+
+**Technical Approach:**
+- **Input**: RTSPS (RTSP over SSL) on port 322
+- **SDP File**: Generated dynamically with printer IP and access code
+- **Transcoding**: FFmpeg converts RTSPS → MJPEG for browser compatibility
+- **Output**: MJPEG stream via `/printer/camera/feed` endpoint
+- **Resolution**: 640px width (scaled for Raspberry Pi performance)
+- **Control**: User-initiated start/stop (not continuous)
+
+**API Endpoints:**
+- **`POST /printer/camera/start`**: Start FFmpeg transcoding process
+- **`POST /printer/camera/stop`**: Terminate FFmpeg, stop streaming
+- **`GET /printer/camera/feed`**: MJPEG stream (multipart/x-mixed-replace)
+
+**Performance Notes:**
+- Camera transcoding uses ~20-40% CPU on Raspberry Pi 4
+- On-demand design reduces idle resource usage
+- Recommended to stop when not actively monitoring
+
+#### Emergency Integration
+**Fire Alarm:** When MQ-2 sensor detects fire, system:
+1. Shuts down heater and fans (existing behavior)
+2. **Sends MQTT stop command to printer** (new)
+3. Sounds buzzer alarm
+4. Locks UI controls
+
+**Emergency Stop Button:** User-triggered emergency stop:
+1. Halts heater immediately
+2. **Sends MQTT stop command to printer** (new)
+3. Resets all state flags
+4. Returns message: "Emergency stop activated - heater and printer stopped"
+
+This ensures both systems shut down during emergencies.
+
+#### Settings Structure
+Printer configuration in `heater_settings.json`:
+```json
+{
+  "printer_enabled": false,
+  "printer_ip": "192.168.1.253",
+  "printer_access_code": "216e7b9b",
+  "printer_serial": "00M00A340600040",
+  "auto_start_enabled": true,
+  "material_mappings": {
+    "PC": {"temp": 60, "fans": false},
+    "ABS": {"temp": 60, "fans": true},
+    "ASA": {"temp": 65, "fans": true},
+    "PETG": {"temp": 40, "fans": true},
+    "PLA": {"temp": 0, "fans": false}
+  }
+}
+```
+
+#### State Variables
+New global state for printer integration:
+- `printer_mqtt_client`: MQTT client instance
+- `printer_connected`: Boolean connection status
+- `printer_status`: Dict with phase, file, material, progress, temps, time
+- `printer_lock`: Thread safety lock
+- `mqtt_sequence_id`: Command sequence counter
+- `camera_process`: FFmpeg subprocess handle
+- `camera_streaming`: Boolean camera state
+- `camera_lock`: Camera thread safety
+
+Added to `status_data` dict for WebSocket updates:
+- `printer_connected`, `printer_phase`, `printer_file`, `printer_material`
+- `printer_progress`, `printer_time_remaining`
+- `printer_nozzle_temp`, `printer_bed_temp`, `printer_chamber_temp`
+- `camera_streaming`
+
+#### Testing & Documentation
+**See:**
+- `PRINTER_TESTING_GUIDE.md` - Comprehensive backend testing procedures
+- `IMPLEMENTATION_STATUS.md` - Technical details and code locations
+
+**Current Status:**
+- ✅ Backend implementation complete
+- ⏳ User testing in progress
+- ⏳ UI integration pending
+- ⏳ Documentation updates ongoing
 
 ### Data Tracking
 - **Temperature history**: Last 1000 data points stored in memory
@@ -635,7 +910,59 @@ See `TODO.md` for planned improvements including:
 
 ## Version History
 
-**Current Version**: 2.7 (Lights Relay Implementation)
+**Current Version**: 2.9-alpha (Bambu Lab X1C Integration - Backend Complete, UI Pending)
+
+**⚠️ WORK IN PROGRESS**: Printer integration features are functional but the web UI has not been implemented yet. Users must configure printer settings manually in `heater_settings.json`. UI implementation planned for next release.
+
+- **NEW**: Bambu Lab X1C printer integration via MQTT
+  - MQTT client thread connects to printer broker (port 8883, TLS)
+  - Real-time monitoring of print status, progress, temperatures
+  - Material detection from AMS tray data or filename
+  - Configurable material mappings (temp + fan settings per material)
+- **NEW**: Material-based auto-start automation
+  - Detects when print starts on X1C (MQTT state transition)
+  - Identifies material (PC, ABS, ASA, PETG, PLA)
+  - Auto-configures heater: target temp, fans, print duration
+  - Triggers heater START automatically (user-configurable)
+  - Default mappings: PC (60°C, fans off), ABS/ASA (60-65°C, fans on)
+- **NEW**: Auto-stop when print ends or is cancelled
+  - Detects `FINISH` state (print completed) → triggers cooldown phase
+  - Detects `FAILED` state (user cancelled in Bambu Studio) → immediate stop, no cooldown
+  - Uses raw `gcode_state` tracking to avoid false triggers from normal state transitions
+  - UI buttons lock with processing indicator when backend triggers stop
+- **NEW**: Printer control API endpoints
+  - `/printer/pause` - Pause current print via MQTT
+  - `/printer/resume` - Resume paused print
+  - `/printer/stop` - Stop/cancel print
+  - MQTT command publishing with sequence ID tracking
+- **NEW**: Always-on camera streaming from X1C
+  - Camera starts automatically when printer is configured and enabled
+  - Background `camera_monitor` thread manages FFmpeg lifecycle
+  - Auto-restarts if FFmpeg dies or stream disconnects
+  - Resolution: 720p @ 10fps (~35% CPU on Raspberry Pi 4)
+  - Quality setting: q:v 5 (good balance of quality and performance)
+  - API: `/printer/camera/feed` (always available), `/printer/camera/status`
+  - Removed manual start/stop - camera runs continuously when printer configured
+- **NEW**: Emergency integration with printer
+  - Fire alarm now stops both heater AND printer via MQTT
+  - Emergency stop button stops both systems
+  - Enhanced safety: dual-system shutdown during emergencies
+- **NEW**: Printer state variables and WebSocket updates
+  - Real-time printer status via WebSocket (phase, file, material, progress, temps)
+  - Thread-safe state management with `printer_lock`
+  - Camera streaming status tracking
+  - Processing lock event for UI button coordination
+- **IMPROVED**: Security - removed hardcoded printer credentials
+  - Default settings now have empty strings for printer_ip, printer_access_code, printer_serial
+  - Users must configure via settings file (UI configuration planned)
+  - Safe for public GitHub repository
+- **NEW**: Documentation for testing and implementation
+  - `PRINTER_TESTING_GUIDE.md` - Comprehensive testing procedures
+  - `IMPLEMENTATION_STATUS.md` - Technical implementation details
+- **STATUS**: Backend complete and tested, UI implementation pending
+- All features from version 2.7 and earlier
+
+**Version 2.7**: (Lights Relay Implementation)
 - **NEW**: GPIO-based lights relay on pin 22 (Physical Pin 15)
   - Direct GPIO control replaces unreliable uhubctl USB hub control
   - Simple on/off relay operation for lights

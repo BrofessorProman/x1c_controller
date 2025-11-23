@@ -8,10 +8,13 @@ from w1thermsensor import W1ThermSensor, SensorNotReadyError
 from simple_pid import PID
 import RPi.GPIO as GPIO
 import subprocess
-from flask import Flask, render_template_string, jsonify, request, send_file
+from flask import Flask, render_template_string, jsonify, request, send_file, Response
 from flask_socketio import SocketIO, emit
 import io
 import csv
+import paho.mqtt.client as mqtt
+import ssl
+import signal
 
 # Configuration Constants
 HYSTERESIS = 2.0  # Temperature hysteresis band in °C
@@ -71,6 +74,7 @@ warmup_complete = False
 awaiting_preheat_confirmation = False
 start_requested = False
 stop_requested = False
+printer_finished = False  # Set when printer sends FINISH - triggers cooldown
 emergency_stop_requested = False
 pause_requested = False
 preheat_confirmed = False
@@ -117,8 +121,42 @@ status_data = {
     'eta_to_target': 0,
     'print_time_remaining': 0,
     'cooldown_time_remaining': 0,
-    'sequence': 0  # Message sequence number to prevent stale updates
+    'sequence': 0,  # Message sequence number to prevent stale updates
+    # Printer status
+    'printer_connected': False,
+    'printer_phase': 'idle',  # idle, printing, paused, finish
+    'printer_file': '',
+    'printer_material': '',
+    'printer_progress': 0,
+    'printer_time_remaining': 0,
+    'printer_nozzle_temp': 0,
+    'printer_bed_temp': 0,
+    'printer_chamber_temp': 0,
+    'camera_streaming': False
 }
+
+# Printer MQTT state
+printer_mqtt_client = None
+printer_connected = False
+printer_status = {
+    'phase': 'idle',
+    'file': '',
+    'material': '',
+    'progress': 0,
+    'time_remaining': 0,
+    'nozzle_temp': 0,
+    'bed_temp': 0,
+    'chamber_temp': 0
+}
+printer_lock = threading.Lock()
+mqtt_sequence_id = 0
+
+# Camera streaming state (always-on when printer configured)
+camera_process = None
+camera_streaming = False
+camera_lock = threading.Lock()
+camera_frame = None  # Latest frame for serving to clients
+camera_frame_lock = threading.Lock()
 
 # DS18B20 Setup
 try:
@@ -196,7 +234,20 @@ def load_settings():
             {'name': 'ABS Standard', 'temp': 60, 'hours': 8, 'minutes': 0},
             {'name': 'ASA Standard', 'temp': 65, 'hours': 10, 'minutes': 0},
             {'name': 'Quick Test', 'temp': 40, 'hours': 0, 'minutes': 30}
-        ]
+        ],
+        # Printer Integration Settings (user must configure via web interface)
+        'printer_enabled': False,  # Enable/disable printer integration
+        'printer_ip': '',  # User configures via settings
+        'printer_access_code': '',  # User configures via settings
+        'printer_serial': '',  # User configures via settings
+        'auto_start_enabled': True,  # Automatically start heater when print detected
+        'material_mappings': {
+            'PC': {'temp': 60, 'fans': False},
+            'ABS': {'temp': 60, 'fans': True},
+            'ASA': {'temp': 65, 'fans': True},
+            'PETG': {'temp': 40, 'fans': True},
+            'PLA': {'temp': 0, 'fans': False}  # No heating for PLA
+        }
     }
 
     if os.path.exists(SETTINGS_FILE):
@@ -367,6 +418,7 @@ status_data['lights_on'] = lights_on
 # Fire Monitor with Web Reset
 def fire_monitor():
     global emergency_stop, heater_on, fans_on, reset_requested
+    global printer_mqtt_client, printer_connected, mqtt_sequence_id
 
     while not shutdown_requested:
         if GPIO.input(FIRE_PIN) == GPIO.LOW:
@@ -383,8 +435,29 @@ def fire_monitor():
                     status_data['emergency_stop'] = True
                     status_data['heater_on'] = False
                     status_data['fans_on'] = False
+
+                # Also stop the printer if connected
+                if printer_connected and printer_mqtt_client:
+                    try:
+                        serial = current_settings.get('printer_serial', '')
+                        topic = f"device/{serial}/request"
+
+                        with printer_lock:
+                            mqtt_sequence_id += 1
+                            command = {
+                                "print": {
+                                    "sequence_id": str(mqtt_sequence_id),
+                                    "command": "stop"
+                                }
+                            }
+
+                        printer_mqtt_client.publish(topic, json.dumps(command), qos=1)
+                        print("🔥 Fire alarm: Sent STOP command to printer")
+                    except Exception as e:
+                        print(f"Error stopping printer during fire alarm: {e}")
+
                 emit_status_update()  # Immediate WebSocket update for fire alarm
-                print("Heater and fans turned off. Use web interface to RESET.")
+                print("Heater, fans, and printer stopped. Use web interface to RESET.")
 
         if emergency_stop and reset_requested:
             if GPIO.input(FIRE_PIN) == GPIO.HIGH:
@@ -551,7 +624,7 @@ def slow_cool(pid, hours=COOLDOWN_HOURS, start_time=None, print_duration=0, paus
 # Main PID Loop
 def main_loop():
     global heater_on, fans_on, additional_seconds, print_active, start_requested
-    global stop_requested, emergency_stop_requested, logging_enabled, log_data
+    global stop_requested, printer_finished, emergency_stop_requested, logging_enabled, log_data
     global heater_manual_override, fans_manual_override, print_paused, pause_requested
     global warmup_complete, awaiting_preheat_confirmation, preheat_confirmed
     global pending_resume, resume_confirmed, resume_aborted, resume_state
@@ -947,6 +1020,11 @@ def main_loop():
                         print("Print stopped by user")
                         break
 
+                    # Check if printer finished (FINISH state) - triggers cooldown
+                    if printer_finished:
+                        print("\nPrint finished on printer. Starting slow cool down.")
+                        break
+
                     if remaining <= 0 and not print_paused:
                         print("\nPrint time expired. Starting slow cool down.")
                         break
@@ -1113,6 +1191,7 @@ def main_loop():
             status_data['print_time_remaining'] = 0
             stop_requested = False
             emergency_stop_requested = False
+            printer_finished = False
             # Clear pause state
             print_paused = False
             pause_requested = False
@@ -1124,6 +1203,343 @@ def main_loop():
         delete_print_state()
 
         print("Print cycle complete.")
+
+# Printer MQTT Monitor Thread
+def printer_monitor():
+    """Monitor Bambu Lab X1C printer via MQTT"""
+    global printer_mqtt_client, printer_connected, printer_status, start_requested, shutdown_requested
+    global desired_temp, print_hours, print_minutes, fans_enabled, current_settings
+
+    # Check if printer integration is enabled
+    if not current_settings.get('printer_enabled', False):
+        print("Printer integration disabled in settings")
+        return
+
+    printer_ip = current_settings.get('printer_ip', '')
+    access_code = current_settings.get('printer_access_code', '')
+    serial = current_settings.get('printer_serial', '')
+
+    if not all([printer_ip, access_code, serial]):
+        print("ERROR: Printer credentials not configured")
+        return
+
+    print(f"Starting printer monitor for {serial} at {printer_ip}")
+
+    # Track previous print phase to detect transitions
+    previous_phase = 'idle'
+    previous_raw_state = 'IDLE'  # Track raw gcode_state for stop detection
+    auto_start_triggered = False  # Track if we've already auto-started for this print
+    last_trigger_time = 0  # Debounce: prevent rapid re-triggers
+    heater_start_time = 0  # Track when heater was auto-started
+
+    def on_connect(client, userdata, flags, rc, *args):
+        global printer_connected
+        if rc == 0:
+            print("✓ Connected to printer MQTT broker")
+            with printer_lock:
+                printer_connected = True
+                status_data['printer_connected'] = True
+
+            # Subscribe to printer status reports
+            topic = f"device/{serial}/report"
+            client.subscribe(topic)
+            print(f"  Subscribed to {topic}")
+            emit_status_update()
+        else:
+            print(f"✗ MQTT connection failed with code {rc}")
+            with printer_lock:
+                printer_connected = False
+                status_data['printer_connected'] = False
+
+    def on_disconnect(client, userdata, rc, *args):
+        global printer_connected
+        print(f"Disconnected from printer MQTT (code: {rc})")
+        with printer_lock:
+            printer_connected = False
+            status_data['printer_connected'] = False
+        emit_status_update()
+
+    def on_message(client, userdata, msg):
+        nonlocal previous_phase, previous_raw_state, auto_start_triggered, last_trigger_time, heater_start_time
+        global printer_status, start_requested, stop_requested, printer_finished, print_active
+        global desired_temp, print_hours, print_minutes, fans_enabled
+
+        try:
+            payload = json.loads(msg.payload.decode('utf-8'))
+
+            # Extract print status from MQTT message
+            if 'print' in payload:
+                print_data = payload['print']
+
+
+                # Get print phase (idle, printing, paused, finish, failed)
+                gcode_state = print_data.get('gcode_state', 'IDLE')
+
+                # Map gcode_state to our simplified phase
+                phase_map = {
+                    'IDLE': 'idle',
+                    'PREPARE': 'printing',
+                    'RUNNING': 'printing',
+                    'PAUSE': 'paused',
+                    'FINISH': 'finish',
+                    'FAILED': 'idle'
+                }
+                phase = phase_map.get(gcode_state, 'idle')
+
+                # Get file info
+                subtask_name = print_data.get('subtask_name', '')
+                gcode_file = print_data.get('gcode_file', '')
+                file_name = subtask_name or gcode_file
+
+                # Get progress (0-100)
+                progress = print_data.get('mc_percent', 0)
+
+                # Get time remaining (in MINUTES from printer) - try multiple field names
+                time_remaining_minutes = print_data.get('mc_remaining_time', 0)
+                if time_remaining_minutes == 0:
+                    time_remaining_minutes = print_data.get('remain_time', 0)
+                # Convert to seconds for internal use
+                time_remaining = time_remaining_minutes * 60
+
+
+                # Try to detect material from AMS or external spool (inside print_data)
+                material = ''
+                if 'ams' in print_data:
+                    ams_data = print_data['ams']
+                    tray_now = ams_data.get('tray_now', 0) if isinstance(ams_data, dict) else 0
+
+                    # tray_now=255 means external spool (not using AMS)
+                    if tray_now == 255 or tray_now == '255':
+                        # Check vt_tray (virtual tray) for external spool material
+                        if 'vt_tray' in print_data:
+                            vt_tray = print_data['vt_tray']
+                            if isinstance(vt_tray, dict):
+                                material = vt_tray.get('tray_type', '')
+                    else:
+                        # Using AMS tray
+                        if isinstance(ams_data, dict) and 'ams' in ams_data and len(ams_data['ams']) > 0:
+                            try:
+                                tray_idx = int(tray_now)
+                                ams_unit = ams_data['ams'][0]
+                                if 'tray' in ams_unit and len(ams_unit['tray']) > tray_idx:
+                                    tray = ams_unit['tray'][tray_idx]
+                                    material = tray.get('tray_type', '')
+                            except (ValueError, IndexError, KeyError, TypeError):
+                                pass
+
+                # Fallback: try to extract from subtask_name or gcode_file using word boundaries
+                if not material and file_name:
+                    import re
+                    # Match material as a word boundary (not inside other words)
+                    for mat in ['PC', 'ABS', 'ASA', 'PETG', 'PLA', 'TPU', 'NYLON']:
+                        # Use word boundary or underscore/dash separators
+                        pattern = r'(?:^|[_\-\s])' + mat + r'(?:$|[_\-\s\.])'
+                        if re.search(pattern, file_name.upper()):
+                            material = mat
+                            break
+
+                # Update printer status
+                with printer_lock:
+                    printer_status['phase'] = phase
+                    printer_status['file'] = file_name
+                    printer_status['material'] = material
+                    printer_status['progress'] = progress
+                    printer_status['time_remaining'] = time_remaining
+
+                    status_data['printer_phase'] = phase
+                    status_data['printer_file'] = file_name
+                    status_data['printer_material'] = material
+                    status_data['printer_progress'] = progress
+                    status_data['printer_time_remaining'] = time_remaining
+
+                # Get temperatures
+                if 'nozzle_temper' in print_data:
+                    nozzle_temp = print_data['nozzle_temper']
+                    with printer_lock:
+                        printer_status['nozzle_temp'] = nozzle_temp
+                        status_data['printer_nozzle_temp'] = nozzle_temp
+
+                if 'bed_temper' in print_data:
+                    bed_temp = print_data['bed_temper']
+                    with printer_lock:
+                        printer_status['bed_temp'] = bed_temp
+                        status_data['printer_bed_temp'] = bed_temp
+
+                if 'chamber_temper' in print_data:
+                    chamber_temp = print_data['chamber_temper']
+                    with printer_lock:
+                        printer_status['chamber_temp'] = chamber_temp
+                        status_data['printer_chamber_temp'] = chamber_temp
+
+                # DETECT PRINT START AND AUTO-START HEATER
+                auto_start_enabled = current_settings.get('auto_start_enabled', True)
+
+                # Check if print just started (transition from idle to printing)
+                # Use state_lock to prevent race conditions with multiple MQTT messages
+                # Also add 30-second debounce to prevent rapid re-triggers
+                current_time = time.time()
+                with state_lock:
+                    time_since_last = current_time - last_trigger_time
+                    should_trigger = (
+                        phase == 'printing' and
+                        previous_phase != 'printing' and
+                        not auto_start_triggered and
+                        time_since_last > 30  # 30-second debounce
+                    )
+                    if should_trigger:
+                        auto_start_triggered = True
+                        last_trigger_time = current_time
+
+                if should_trigger:
+                    print(f"📄 Print detected: {file_name} ({material or 'unknown material'})")
+
+                    # Auto-start heater if enabled and material is mapped
+                    if auto_start_enabled and material and not print_active:
+                        material_mappings = current_settings.get('material_mappings', {})
+
+                        if material in material_mappings:
+                            mapping = material_mappings[material]
+                            target_temp = mapping['temp']
+                            fans = mapping['fans']
+
+                            # Convert time_remaining to hours/minutes
+                            hours = time_remaining // 3600
+                            minutes = (time_remaining % 3600) // 60
+
+                            print(f"🤖 Auto-starting heater:")
+                            print(f"   Target: {target_temp}°C")
+                            print(f"   Fans: {'ON' if fans else 'OFF'}")
+                            print(f"   Print time: {hours}h {minutes}m")
+
+                            # Emit processing lock FIRST to lock UI buttons
+                            emit_processing_lock('start')
+
+                            # Update settings
+                            with state_lock:
+                                desired_temp = target_temp
+                                print_hours = hours
+                                print_minutes = minutes
+                                fans_enabled = fans
+
+                                current_settings['desired_temp'] = target_temp
+                                current_settings['print_hours'] = hours
+                                current_settings['print_minutes'] = minutes
+                                current_settings['fans_enabled'] = fans
+
+                                # Trigger heater start
+                                start_requested = True
+                                heater_start_time = current_time
+
+                            # Emit notification
+                            emit_notification(
+                                f"{material} Print Detected",
+                                f"Starting chamber heater: {target_temp}°C, Fans {'ON' if fans else 'OFF'}, {hours}h {minutes}m"
+                            )
+                        else:
+                            print(f"⚠️  No material mapping found for '{material}' - skipping auto-start")
+                    elif not auto_start_enabled:
+                        print("   (Auto-start disabled)")
+
+                # Detect print completion or cancellation and stop heater
+                # Use raw gcode_state to differentiate:
+                # - FINISH = print completed normally
+                # - FAILED = user cancelled in Bambu Studio
+                # - IDLE/UNKNOWN = ignore (normal state transitions during printing)
+                heater_run_time = current_time - heater_start_time if heater_start_time > 0 else 0
+                raw_gcode_state = print_data.get('gcode_state', None)  # None if not present
+
+                # Only process stop detection if we have a valid gcode_state
+                if raw_gcode_state:
+                    # Log terminal states for monitoring
+                    if raw_gcode_state in ('FINISH', 'FAILED'):
+                        print(f"📡 Printer state: {raw_gcode_state} (prev={previous_raw_state}, active={print_active}, triggered={auto_start_triggered})", flush=True)
+
+                    # Only stop heater on FINISH or FAILED states when previously RUNNING or PREPARE
+                    if raw_gcode_state in ('FINISH', 'FAILED') and previous_raw_state in ('RUNNING', 'PREPARE', 'PAUSE'):
+                        if print_active and auto_start_triggered:
+                            # Emit processing lock FIRST to lock UI buttons before notification
+                            emit_processing_lock('stop')
+                            if raw_gcode_state == 'FINISH':
+                                # Print completed normally - trigger cooldown
+                                print(f"✅ Print finished on printer, starting cooldown (ran {heater_run_time:.0f}s)")
+                                emit_notification("Print Finished", "Printer finished - starting cooldown")
+                                with state_lock:
+                                    printer_finished = True  # This triggers cooldown
+                            else:  # FAILED
+                                # User cancelled - stop immediately, no cooldown
+                                print(f"🛑 Print cancelled in Bambu Studio, stopping heater (ran {heater_run_time:.0f}s)")
+                                emit_notification("Print Cancelled", "Print stopped - heater off")
+                                with state_lock:
+                                    stop_requested = True  # This skips cooldown
+                            # Reset flags for next print
+                            auto_start_triggered = False
+                            heater_start_time = 0
+
+                    # Update previous raw state (only when we have a valid state)
+                    previous_raw_state = raw_gcode_state
+
+                # Update previous phase
+                previous_phase = phase
+
+                # Emit WebSocket update
+                emit_status_update()
+
+        except json.JSONDecodeError as e:
+            print(f"Error parsing MQTT message: {e}")
+        except Exception as e:
+            print(f"Error processing MQTT message: {e}")
+
+    # Create MQTT client (handle both paho-mqtt 1.x and 2.x APIs)
+    try:
+        # Try paho-mqtt 2.0+ API first
+        printer_mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=f"heater_controller_{int(time.time())}")
+        print("Using paho-mqtt 2.x API")
+    except (AttributeError, TypeError):
+        # Fall back to paho-mqtt 1.x API
+        printer_mqtt_client = mqtt.Client(client_id=f"heater_controller_{int(time.time())}")
+        print("Using paho-mqtt 1.x API")
+
+    try:
+        printer_mqtt_client.username_pw_set("bblp", access_code)
+        printer_mqtt_client.tls_set(cert_reqs=ssl.CERT_NONE)
+        printer_mqtt_client.tls_insecure_set(True)
+        printer_mqtt_client.on_connect = on_connect
+        printer_mqtt_client.on_disconnect = on_disconnect
+        printer_mqtt_client.on_message = on_message
+    except Exception as e:
+        print(f"ERROR: Failed to configure MQTT client: {e}")
+        return
+
+    # Initial connection
+    try:
+        print(f"Connecting to printer at {printer_ip}:8883...", flush=True)
+        printer_mqtt_client.connect(printer_ip, 8883, 60)
+        printer_mqtt_client.loop_start()
+        print("MQTT loop started", flush=True)
+    except Exception as e:
+        print(f"Initial MQTT connection failed: {e}", flush=True)
+
+    # Connection monitoring loop with auto-reconnect
+    while not shutdown_requested:
+        try:
+            if not printer_connected:
+                print(f"Reconnecting to printer at {printer_ip}:8883...")
+                printer_mqtt_client.reconnect()
+
+            time.sleep(5)
+
+        except Exception as e:
+            print(f"Printer MQTT error: {e}")
+            with printer_lock:
+                printer_connected = False
+                status_data['printer_connected'] = False
+            time.sleep(10)  # Wait before retry
+
+    # Cleanup on shutdown
+    if printer_mqtt_client:
+        printer_mqtt_client.loop_stop()
+        printer_mqtt_client.disconnect()
+    print("Printer monitor stopped")
 
 # Flask Web Interface
 app = Flask(__name__)
@@ -1147,6 +1563,10 @@ def emit_status_update():
 def emit_notification(title, message):
     """Emit notification to all connected clients"""
     socketio.emit('notification', {'title': title, 'message': message}, namespace='/')
+
+def emit_processing_lock(action):
+    """Emit processing lock to frontend when backend initiates an action (e.g., printer-triggered stop)"""
+    socketio.emit('processing_lock', {'action': action}, namespace='/')
 
 def emit_history_update(data_point):
     """Emit new history data point to all connected clients"""
@@ -3271,6 +3691,23 @@ HTML_TEMPLATE = """
             showNotification(data.title, data.message);
         });
 
+        // Backend-initiated processing lock (e.g., printer triggered a stop)
+        socket.on('processing_lock', (data) => {
+            console.log(`[BACKEND] Processing lock received for action: ${data.action}`);
+            const startBtn = document.getElementById('start-btn');
+            const pauseBtn = document.getElementById('pause-btn');
+            const stopBtn = document.getElementById('stop-btn');
+            const emergencyStopBtn = document.getElementById('emergency-stop-btn');
+
+            // Lock UI based on the action
+            if (data.action === 'stop') {
+                // Same as user clicking STOP - lock stop button, block others
+                lockOptimisticUpdate(stopBtn, [startBtn, pauseBtn, emergencyStopBtn]);
+            } else if (data.action === 'start') {
+                lockOptimisticUpdate(startBtn, [stopBtn, pauseBtn, emergencyStopBtn]);
+            }
+        });
+
         // Update temperature graph every 5 seconds (WebSocket doesn't handle history data)
         setInterval(updateHistory, 5000);
 
@@ -3469,13 +3906,34 @@ def abort_resume():
 @app.route('/emergency_stop', methods=['POST'])
 def emergency_stop_route():
     global emergency_stop_requested, stop_requested, additional_seconds
+    global printer_mqtt_client, printer_connected, mqtt_sequence_id
 
     with state_lock:
         emergency_stop_requested = True
         stop_requested = True
         additional_seconds = 0  # Reset time adjustments when emergency stopping
 
-    return jsonify({'success': True, 'message': 'Emergency stop activated'})
+    # Also stop the printer if connected
+    if printer_connected and printer_mqtt_client:
+        try:
+            serial = current_settings.get('printer_serial', '')
+            topic = f"device/{serial}/request"
+
+            with printer_lock:
+                mqtt_sequence_id += 1
+                command = {
+                    "print": {
+                        "sequence_id": str(mqtt_sequence_id),
+                        "command": "stop"
+                    }
+                }
+
+            printer_mqtt_client.publish(topic, json.dumps(command), qos=1)
+            print("⚠️  Emergency stop: Sent STOP command to printer")
+        except Exception as e:
+            print(f"Error stopping printer during emergency: {e}")
+
+    return jsonify({'success': True, 'message': 'Emergency stop activated - heater and printer stopped'})
 
 @app.route('/toggle_heater', methods=['POST'])
 def toggle_heater():
@@ -3525,6 +3983,277 @@ def toggle_lights():
 
     emit_status_update()  # Immediate WebSocket update for lights control
     return jsonify({'success': True})
+
+# Printer Control Endpoints
+@app.route('/printer/pause', methods=['POST'])
+def printer_pause():
+    """Send pause command to printer via MQTT"""
+    global printer_mqtt_client, printer_connected, mqtt_sequence_id
+
+    if not printer_connected or not printer_mqtt_client:
+        return jsonify({'success': False, 'message': 'Printer not connected'})
+
+    try:
+        serial = current_settings.get('printer_serial', '')
+        topic = f"device/{serial}/request"
+
+        with printer_lock:
+            mqtt_sequence_id += 1
+            command = {
+                "print": {
+                    "sequence_id": str(mqtt_sequence_id),
+                    "command": "pause"
+                }
+            }
+
+        printer_mqtt_client.publish(topic, json.dumps(command), qos=1)
+        print(f"Sent PAUSE command to printer")
+        return jsonify({'success': True})
+
+    except Exception as e:
+        print(f"Error sending pause command: {e}")
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/printer/resume', methods=['POST'])
+def printer_resume():
+    """Send resume command to printer via MQTT"""
+    global printer_mqtt_client, printer_connected, mqtt_sequence_id
+
+    if not printer_connected or not printer_mqtt_client:
+        return jsonify({'success': False, 'message': 'Printer not connected'})
+
+    try:
+        serial = current_settings.get('printer_serial', '')
+        topic = f"device/{serial}/request"
+
+        with printer_lock:
+            mqtt_sequence_id += 1
+            command = {
+                "print": {
+                    "sequence_id": str(mqtt_sequence_id),
+                    "command": "resume"
+                }
+            }
+
+        printer_mqtt_client.publish(topic, json.dumps(command), qos=1)
+        print(f"Sent RESUME command to printer")
+        return jsonify({'success': True})
+
+    except Exception as e:
+        print(f"Error sending resume command: {e}")
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/printer/stop', methods=['POST'])
+def printer_stop():
+    """Send stop command to printer via MQTT"""
+    global printer_mqtt_client, printer_connected, mqtt_sequence_id
+
+    if not printer_connected or not printer_mqtt_client:
+        return jsonify({'success': False, 'message': 'Printer not connected'})
+
+    try:
+        serial = current_settings.get('printer_serial', '')
+        topic = f"device/{serial}/request"
+
+        with printer_lock:
+            mqtt_sequence_id += 1
+            command = {
+                "print": {
+                    "sequence_id": str(mqtt_sequence_id),
+                    "command": "stop"
+                }
+            }
+
+        printer_mqtt_client.publish(topic, json.dumps(command), qos=1)
+        print(f"Sent STOP command to printer")
+        return jsonify({'success': True})
+
+    except Exception as e:
+        print(f"Error sending stop command: {e}")
+        return jsonify({'success': False, 'message': str(e)})
+
+# Camera Streaming Functions
+
+def camera_monitor():
+    """Background thread that keeps camera stream running when printer is configured.
+    Stores latest frame in shared buffer for clients to read."""
+    global camera_process, camera_streaming, camera_frame
+
+    print("Camera monitor thread started")
+
+    while not shutdown_requested:
+        try:
+            # Check if printer is configured
+            printer_ip = current_settings.get('printer_ip', '')
+            access_code = current_settings.get('printer_access_code', '')
+            printer_enabled = current_settings.get('printer_enabled', False)
+
+            if not printer_enabled or not printer_ip or not access_code:
+                # Printer not configured, wait and retry
+                time.sleep(5)
+                continue
+
+            # Start FFmpeg if not running
+            with camera_lock:
+                if camera_process is not None and camera_process.poll() is None:
+                    # Already running, wait a bit
+                    time.sleep(1)
+                    continue
+
+                # Start camera stream
+                print(f"📷 Starting camera stream from {printer_ip}...")
+                camera_streaming = True
+                status_data['camera_streaming'] = True
+
+                stream_url = f"rtsps://bblp:{access_code}@{printer_ip}:322/streaming/live/1"
+
+                camera_process = subprocess.Popen([
+                    'ffmpeg',
+                    '-rtsp_transport', 'tcp',
+                    '-i', stream_url,
+                    '-f', 'image2pipe',
+                    '-vcodec', 'mjpeg',
+                    '-q:v', '5',  # Quality (2=best, 31=worst) - 5 is good balance
+                    '-vf', 'scale=1280:-1,fps=10',  # 720p @ 10fps - ~35% CPU
+                    '-'
+                ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**6)
+
+            # Give FFmpeg a moment to start
+            time.sleep(2)
+
+            if camera_process.poll() is not None:
+                stderr_output = camera_process.stderr.read().decode('utf-8', errors='ignore')
+                print(f"Camera stream failed to start: {stderr_output[:200]}")
+                with camera_lock:
+                    camera_streaming = False
+                    status_data['camera_streaming'] = False
+                    camera_process = None
+                time.sleep(10)  # Wait before retry
+                continue
+
+            print("📷 Camera stream started successfully")
+            emit_status_update()
+
+            # Read frames continuously and store in shared buffer
+            buffer = b''
+            while not shutdown_requested and camera_process.poll() is None:
+                chunk = camera_process.stdout.read(4096)
+                if not chunk:
+                    break
+
+                buffer += chunk
+
+                # Extract JPEG frames (start: FFD8, end: FFD9)
+                while True:
+                    start = buffer.find(b'\xff\xd8')
+                    if start == -1:
+                        buffer = b''
+                        break
+
+                    end = buffer.find(b'\xff\xd9', start + 2)
+                    if end == -1:
+                        buffer = buffer[start:]
+                        break
+
+                    # Store complete frame
+                    frame = buffer[start:end + 2]
+                    buffer = buffer[end + 2:]
+
+                    with camera_frame_lock:
+                        camera_frame = frame
+
+            # FFmpeg stopped
+            print("📷 Camera stream stopped, will restart...")
+            with camera_lock:
+                camera_streaming = False
+                status_data['camera_streaming'] = False
+                if camera_process:
+                    camera_process.terminate()
+                    camera_process.wait()
+                    camera_process = None
+
+            emit_status_update()
+            time.sleep(5)  # Wait before restart
+
+        except Exception as e:
+            print(f"Camera monitor error: {e}", flush=True)
+            with camera_lock:
+                camera_streaming = False
+                status_data['camera_streaming'] = False
+                if camera_process:
+                    try:
+                        camera_process.terminate()
+                        camera_process.wait()
+                    except:
+                        pass
+                    camera_process = None
+            time.sleep(10)
+
+    # Cleanup on shutdown
+    with camera_lock:
+        if camera_process:
+            camera_process.terminate()
+            camera_process.wait()
+            camera_process = None
+        camera_streaming = False
+    print("Camera monitor thread stopped")
+
+def generate_sdp_file():
+    """Generate SDP file for Bambu Lab camera stream"""
+    printer_ip = current_settings.get('printer_ip', '')
+    access_code = current_settings.get('printer_access_code', '')
+
+    sdp_content = f"""v=0
+o=- 0 0 IN IP4 {printer_ip}
+s=No Name
+c=IN IP4 {printer_ip}
+t=0 0
+a=tool:libavformat 58.76.100
+m=video 0 RTP/AVP 96
+a=rtpmap:96 H264/90000
+a=fmtp:96 packetization-mode=1
+a=control:rtsps://bblp:{access_code}@{printer_ip}:322/streaming/live/1
+"""
+    return sdp_content
+
+def camera_frame_generator():
+    """Generator that serves frames from the shared buffer (fed by camera_monitor thread)"""
+    last_frame = None
+    while True:
+        with camera_frame_lock:
+            current_frame = camera_frame
+
+        if current_frame is None:
+            # No frame yet, wait
+            time.sleep(0.1)
+            continue
+
+        if current_frame != last_frame:
+            last_frame = current_frame
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + current_frame + b'\r\n')
+        else:
+            # Same frame, small delay to prevent busy loop
+            time.sleep(0.05)
+
+@app.route('/printer/camera/status')
+def camera_status():
+    """Get camera streaming status"""
+    return jsonify({
+        'streaming': camera_streaming,
+        'printer_configured': bool(current_settings.get('printer_ip', '')) and bool(current_settings.get('printer_access_code', '')),
+        'printer_enabled': current_settings.get('printer_enabled', False)
+    })
+
+@app.route('/printer/camera/feed')
+def camera_feed():
+    """Stream camera feed as MJPEG (always-on when printer configured)"""
+    if not camera_streaming:
+        # Return placeholder or error
+        return jsonify({'error': 'Camera not available', 'reason': 'Printer not configured or camera starting'}), 503
+
+    return Response(camera_frame_generator(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/adjust_time', methods=['POST'])
 def adjust_time():
@@ -3577,10 +4306,14 @@ def run_flask():
 # Start monitoring threads
 fire_thread = threading.Thread(target=fire_monitor, daemon=True)
 main_thread = threading.Thread(target=main_loop, daemon=True)
+printer_thread = threading.Thread(target=printer_monitor, daemon=True)
+camera_thread = threading.Thread(target=camera_monitor, daemon=True)
 flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 fire_thread.start()
 main_thread.start()
+printer_thread.start()
+camera_thread.start()
 flask_thread.start()
 
 print("\n" + "="*50)

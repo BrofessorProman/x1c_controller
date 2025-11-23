@@ -30,6 +30,12 @@ heater_settings.json
 print_state.json
 temperature_log*.csv
 
+# Testing and debug files (may contain user credentials)
+DO_NOT_READ.txt
+X1C_Pinter_Log.txt
+PRINTER_TESTING_GUIDE.md
+*.log
+
 # IDE
 .vscode/
 .idea/

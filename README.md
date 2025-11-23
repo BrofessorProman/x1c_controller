@@ -1,13 +1,15 @@
 # X1C Chamber Heater Controller
 
-A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber heating with a modern web interface.
+A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber heating with a modern web interface and Bambu Lab X1C printer integration.
 
-![Status](https://img.shields.io/badge/status-production-brightgreen)
+![Status](https://img.shields.io/badge/status-beta-yellow)
 ![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi-red)
 ![Python](https://img.shields.io/badge/python-3.7+-blue)
+![Version](https://img.shields.io/badge/version-2.8--alpha-blue)
 
 ## Features
 
+### Core Features
 - 🌡️ **PID Temperature Control** - Precise chamber temperature management
 - 🌐 **Web Interface** - Full control via browser (desktop/mobile)
 - ⚡ **WebSocket Real-Time Updates** - Instant UI response (<50ms latency) with optimistic updates
@@ -28,6 +30,15 @@ A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber
 - 🔐 **Fire Alarm Lockdown** - All controls disabled during fire emergency
 - 🔄 **GPIO State Sync** - Detects hardware state on service restart
 - 💾 **Crash Recovery** - Resume interrupted prints after crashes or restarts
+
+### Bambu Lab X1C Integration (v2.8-alpha) 🆕
+- 🖨️ **MQTT Printer Monitoring** - Real-time print status, progress, and temperatures
+- 🤖 **Material-Based Auto-Start** - Automatically configures heater when print starts based on material (PC, ABS, ASA, PETG, PLA)
+- 🎮 **Printer Control** - Pause/Resume/Stop prints via API endpoints
+- 📹 **Live Camera Feed** - On-demand streaming from X1C camera (FFmpeg + RTSPS)
+- 🔧 **Configurable Mappings** - Custom temperature and fan settings per material
+- 🚨 **Emergency Integration** - Fire alarm and emergency stop also halt printer
+- ⚙️ **Backend Complete** - Full MQTT integration ready, UI pending
 
 ## Quick Start
 
@@ -129,6 +140,57 @@ sudo systemctl start x1c-heater
 # Check status
 sudo systemctl status x1c-heater
 ```
+
+### 6. Bambu Lab X1C Integration Setup (Optional)
+
+**Prerequisites:**
+- Bambu Lab X1C printer on same network
+- Developer Mode enabled on X1C
+- LAN Mode Liveview enabled
+
+**Installation:**
+```bash
+# Install FFmpeg for camera streaming
+sudo apt-get install ffmpeg
+```
+
+**Configuration:**
+Edit `heater_settings.json` (created on first run) or create manually:
+```json
+{
+  "printer_enabled": true,
+  "printer_ip": "192.168.1.253",
+  "printer_access_code": "your_lan_access_code",
+  "printer_serial": "00M00A340600040",
+  "auto_start_enabled": true,
+  "material_mappings": {
+    "PC": {"temp": 60, "fans": false},
+    "ABS": {"temp": 60, "fans": true},
+    "ASA": {"temp": 65, "fans": true},
+    "PETG": {"temp": 40, "fans": true},
+    "PLA": {"temp": 0, "fans": false}
+  }
+}
+```
+
+**Getting Printer Credentials:**
+1. On X1C touchscreen: Settings → Network → LAN Mode
+2. Enable **Developer Mode**
+3. Enable **LAN Mode Liveview**
+4. Note the **Access Code** (your LAN password)
+5. Find Serial Number in Settings → About
+
+**Testing:**
+See `PRINTER_TESTING_GUIDE.md` for comprehensive testing procedures.
+
+**Features:**
+- **Auto-Start**: Heater automatically configures when print starts
+- **Material Detection**: Identifies material from AMS or filename
+- **Printer Control**: Pause/Resume/Stop via API
+- **Camera Streaming**: Live feed on-demand
+- **Emergency Integration**: Fire alarm stops both heater and printer
+
+**Backend Status:** ✅ Complete | **UI Status:** ⏳ Pending
 
 ## Usage
 
@@ -319,16 +381,18 @@ sudo systemctl start x1c-heater
 
 ```
 x1c_controller/
-├── x1c_heater.py           # Main application
-├── requirements.txt         # Python dependencies
-├── heater_settings.json    # Auto-generated settings
-├── print_state.json        # Crash recovery state (auto-generated)
-├── README.md               # This file
-├── CLAUDE.md               # Technical documentation
-├── SERVICE_MANAGEMENT.md   # Service management guide
-├── TODO.md                 # Future improvements
-├── WIREGUARD_SETUP.md      # VPN setup guide
-└── venv/                   # Virtual environment
+├── x1c_heater.py              # Main application
+├── requirements.txt            # Python dependencies
+├── heater_settings.json       # Auto-generated settings
+├── print_state.json           # Crash recovery state (auto-generated)
+├── README.md                  # This file
+├── CLAUDE.md                  # Technical documentation
+├── SERVICE_MANAGEMENT.md      # Service management guide
+├── TODO.md                    # Future improvements
+├── WIREGUARD_SETUP.md         # VPN setup guide
+├── PRINTER_TESTING_GUIDE.md   # Bambu Lab X1C testing procedures (NEW)
+├── IMPLEMENTATION_STATUS.md   # Implementation details (NEW)
+└── venv/                      # Virtual environment
 ```
 
 ## Requirements
@@ -366,6 +430,6 @@ Contributions welcome! Please:
 
 ---
 
-**Version**: 2.7 (Lights Relay Implementation)
-**Status**: Production Ready ✅
-**Last Updated**: 2025-11-15
+**Version**: 2.8-alpha (Bambu Lab X1C Integration - Backend Complete)
+**Status**: Beta - Backend Complete, UI Pending ⏳
+**Last Updated**: 2025-01-15

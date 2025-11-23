@@ -4,4 +4,6 @@ RPi.GPIO>=0.7.0
 Flask>=2.0.0
 flask-socketio>=5.3.0
 python-socketio>=5.10.0
+paho-mqtt>=1.6.0
 # Chart.js and Socket.IO client are loaded via CDN in the web interface, no Python package needed
+# FFmpeg is required for camera streaming (install via: sudo apt-get install ffmpeg)
