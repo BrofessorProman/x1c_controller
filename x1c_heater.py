@@ -149,6 +149,17 @@ printer_status = {
     'chamber_temp': 0
 }
 printer_lock = threading.Lock()
+# Remember the last known mapping target to prevent flickering when mapping field is absent
+last_mapping_target = -1
+# Remember last known AMS data to prevent flickering when data is missing from message
+last_ams_slots = ['', '', '', '']
+last_external_spool = ''
+last_tray_now = -1
+# Remember last known print info to prevent text flickering
+last_file_name = ''
+last_progress = 0
+last_time_remaining = 0
+last_material = ''
 mqtt_sequence_id = 0
 
 # Camera streaming state (always-on when printer configured)
@@ -246,8 +257,21 @@ def load_settings():
             'ABS': {'temp': 60, 'fans': True},
             'ASA': {'temp': 65, 'fans': True},
             'PETG': {'temp': 40, 'fans': True},
-            'PLA': {'temp': 0, 'fans': False}  # No heating for PLA
-        }
+            'PLA': {'temp': 0, 'fans': False},  # No heating for PLA
+            'HIPS': {'temp': 60, 'fans': True},
+            'TPU': {'temp': 40, 'fans': False},
+            'NYLON': {'temp': 60, 'fans': False}
+        },
+        # AMS slot overrides - manually assign material if AMS can't read RFID
+        # Empty string means use auto-detection from printer
+        'ams_slot_overrides': {
+            '0': '',  # Slot 1 (index 0)
+            '1': '',  # Slot 2 (index 1)
+            '2': '',  # Slot 3 (index 2)
+            '3': ''   # Slot 4 (index 3)
+        },
+        # External spool material - what's loaded in the spool holder
+        'external_spool_material': ''  # Empty means use auto-detection
     }
 
     if os.path.exists(SETTINGS_FILE):
@@ -1271,9 +1295,10 @@ def printer_monitor():
             if 'print' in payload:
                 print_data = payload['print']
 
-
                 # Get print phase (idle, printing, paused, finish, failed)
-                gcode_state = print_data.get('gcode_state', 'IDLE')
+                # IMPORTANT: Only update phase if gcode_state is actually present in message
+                # Some MQTT messages don't include gcode_state, keep previous phase in that case
+                gcode_state = print_data.get('gcode_state', None)
 
                 # Map gcode_state to our simplified phase
                 phase_map = {
@@ -1284,59 +1309,157 @@ def printer_monitor():
                     'FINISH': 'finish',
                     'FAILED': 'idle'
                 }
-                phase = phase_map.get(gcode_state, 'idle')
 
-                # Get file info
+                if gcode_state is not None:
+                    phase = phase_map.get(gcode_state, previous_phase)
+                else:
+                    phase = previous_phase  # Keep previous phase if gcode_state not in message
+
+                # Get file info - use sticky values to prevent flickering
+                global last_file_name, last_progress, last_time_remaining
                 subtask_name = print_data.get('subtask_name', '')
                 gcode_file = print_data.get('gcode_file', '')
-                file_name = subtask_name or gcode_file
+                new_file_name = subtask_name or gcode_file
+                if new_file_name:
+                    file_name = new_file_name
+                    last_file_name = new_file_name
+                else:
+                    file_name = last_file_name  # Keep previous value
 
-                # Get progress (0-100)
-                progress = print_data.get('mc_percent', 0)
+                # Get progress (0-100) - use sticky value
+                new_progress = print_data.get('mc_percent', None)
+                if new_progress is not None:
+                    progress = new_progress
+                    last_progress = new_progress
+                else:
+                    progress = last_progress  # Keep previous value
 
                 # Get time remaining (in MINUTES from printer) - try multiple field names
-                time_remaining_minutes = print_data.get('mc_remaining_time', 0)
-                if time_remaining_minutes == 0:
-                    time_remaining_minutes = print_data.get('remain_time', 0)
-                # Convert to seconds for internal use
-                time_remaining = time_remaining_minutes * 60
+                time_remaining_minutes = print_data.get('mc_remaining_time', None)
+                if time_remaining_minutes is None:
+                    time_remaining_minutes = print_data.get('remain_time', None)
+                # Convert to seconds for internal use, use sticky value
+                if time_remaining_minutes is not None:
+                    time_remaining = time_remaining_minutes * 60
+                    last_time_remaining = time_remaining
+                else:
+                    time_remaining = last_time_remaining  # Keep previous value
 
 
                 # Try to detect material from AMS or external spool (inside print_data)
-                material = ''
-                if 'ams' in print_data:
-                    ams_data = print_data['ams']
-                    tray_now = ams_data.get('tray_now', 0) if isinstance(ams_data, dict) else 0
+                # Priority: mapping (slicer assignment) > vir_slot > tray_tar > tray_now
+                raw_material = ''
+                tray_idx = -1  # Track which slot is being used
+                is_external_spool = False
 
-                    # tray_now=255 means external spool (not using AMS)
-                    if tray_now == 255 or tray_now == '255':
-                        # Check vt_tray (virtual tray) for external spool material
-                        if 'vt_tray' in print_data:
-                            vt_tray = print_data['vt_tray']
-                            if isinstance(vt_tray, dict):
-                                material = vt_tray.get('tray_type', '')
-                    else:
-                        # Using AMS tray
-                        if isinstance(ams_data, dict) and 'ams' in ams_data and len(ams_data['ams']) > 0:
+                # BEST SOURCE: 'mapping' field contains the slicer's filament assignment
+                # e.g., [1] means the print uses slot 1
+                mapping = print_data.get('mapping', None)
+                if mapping and isinstance(mapping, list) and len(mapping) > 0:
+                    try:
+                        # Use the first mapped slot (for single-material prints)
+                        mapped_slot = int(mapping[0])
+                        if mapped_slot == 255:
+                            # External spool
+                            is_external_spool = True
+                            # Check vir_slot for material info
+                            vir_slot = print_data.get('vir_slot', [])
+                            if vir_slot and isinstance(vir_slot, list) and len(vir_slot) > 0:
+                                raw_material = vir_slot[0].get('tray_type', '')
+                            # Check user override
+                            external_override = current_settings.get('external_spool_material', '')
+                            if external_override:
+                                raw_material = external_override
+                        elif 0 <= mapped_slot < 4:
+                            tray_idx = mapped_slot
+                            # Check user override for this AMS slot first
+                            ams_overrides = current_settings.get('ams_slot_overrides', {})
+                            slot_override = ams_overrides.get(str(tray_idx), '')
+                            if slot_override:
+                                raw_material = slot_override
+                            elif 'ams' in print_data:
+                                ams_data = print_data['ams']
+                                if isinstance(ams_data, dict) and 'ams' in ams_data and len(ams_data['ams']) > 0:
+                                    ams_unit = ams_data['ams'][0]
+                                    if 'tray' in ams_unit and len(ams_unit['tray']) > tray_idx:
+                                        tray = ams_unit['tray'][tray_idx]
+                                        raw_material = tray.get('tray_type', '')
+                    except (ValueError, TypeError, IndexError):
+                        pass
+
+                # FALLBACK: If mapping not available, use tray_tar/tray_now
+                if not raw_material and 'ams' in print_data:
+                    ams_data = print_data['ams']
+                    if isinstance(ams_data, dict):
+                        tray_tar = ams_data.get('tray_tar', None)
+                        tray_now = ams_data.get('tray_now', None)
+                        active_tray = tray_tar if tray_tar is not None else tray_now
+
+                        if active_tray is not None:
                             try:
-                                tray_idx = int(tray_now)
-                                ams_unit = ams_data['ams'][0]
-                                if 'tray' in ams_unit and len(ams_unit['tray']) > tray_idx:
-                                    tray = ams_unit['tray'][tray_idx]
-                                    material = tray.get('tray_type', '')
-                            except (ValueError, IndexError, KeyError, TypeError):
-                                pass
+                                active_tray = int(active_tray)
+                            except (ValueError, TypeError):
+                                active_tray = None
+
+                        if active_tray == 255:
+                            is_external_spool = True
+                            external_override = current_settings.get('external_spool_material', '')
+                            if external_override:
+                                raw_material = external_override
+                            elif 'vt_tray' in print_data:
+                                vt_tray = print_data['vt_tray']
+                                if isinstance(vt_tray, dict):
+                                    raw_material = vt_tray.get('tray_type', '')
+                        elif active_tray is not None and 0 <= active_tray < 4:
+                            if 'ams' in ams_data and len(ams_data['ams']) > 0:
+                                try:
+                                    tray_idx = active_tray
+                                    ams_overrides = current_settings.get('ams_slot_overrides', {})
+                                    slot_override = ams_overrides.get(str(tray_idx), '')
+                                    if slot_override:
+                                        raw_material = slot_override
+                                    else:
+                                        ams_unit = ams_data['ams'][0]
+                                        if 'tray' in ams_unit and len(ams_unit['tray']) > tray_idx:
+                                            tray = ams_unit['tray'][tray_idx]
+                                            raw_material = tray.get('tray_type', '')
+                                except (ValueError, IndexError, KeyError, TypeError):
+                                    pass
+
+                # Normalize material to match mapping keys (e.g., "PLA Basic" -> "PLA")
+                # Check longer names first to avoid "PC" matching before "PLA" or "PETG"
+                material = ''
+                known_materials = ['PETG', 'PLA', 'ABS', 'ASA', 'NYLON', 'TPU', 'PC', 'HIPS']
+                if raw_material:
+                    raw_upper = raw_material.upper()
+                    # First check for exact match (for user overrides)
+                    if raw_upper in known_materials:
+                        material = raw_upper
+                    else:
+                        # Then check for substring match
+                        for mat in known_materials:
+                            if mat in raw_upper:
+                                material = mat
+                                break
 
                 # Fallback: try to extract from subtask_name or gcode_file using word boundaries
                 if not material and file_name:
                     import re
                     # Match material as a word boundary (not inside other words)
-                    for mat in ['PC', 'ABS', 'ASA', 'PETG', 'PLA', 'TPU', 'NYLON']:
+                    # Check longer/more specific names first (PLA before PC)
+                    for mat in known_materials:
                         # Use word boundary or underscore/dash separators
                         pattern = r'(?:^|[_\-\s])' + mat + r'(?:$|[_\-\s\.])'
                         if re.search(pattern, file_name.upper()):
                             material = mat
                             break
+
+                # Apply stickiness for material - use last known value if current is empty
+                global last_material
+                if material:
+                    last_material = material
+                elif last_material and phase != 'idle':
+                    material = last_material  # Keep previous value during print
 
                 # Update printer status
                 with printer_lock:
@@ -1370,6 +1493,82 @@ def printer_monitor():
                     with printer_lock:
                         printer_status['chamber_temp'] = chamber_temp
                         status_data['printer_chamber_temp'] = chamber_temp
+
+                # Extract AMS slot data for UI display
+                # Use remembered values as defaults to prevent flickering when data is missing
+                global last_mapping_target, last_ams_slots, last_external_spool, last_tray_now
+                ams_slots_data = last_ams_slots[:]  # Start with last known values
+                external_spool_data = last_external_spool
+                current_tray = last_tray_now  # Start with last known value
+                target_tray = -1   # Target tray for print job (from mapping field)
+
+                # Get target tray from 'mapping' field (slicer's filament assignment)
+                # This is more reliable than tray_tar which only updates after filament change starts
+                mapping = print_data.get('mapping', None)
+                mapping_present = mapping and isinstance(mapping, list) and len(mapping) > 0
+                if mapping_present:
+                    try:
+                        new_target = int(mapping[0])
+                        # Update and remember the mapping target
+                        target_tray = new_target
+                        last_mapping_target = new_target
+                    except (ValueError, TypeError):
+                        pass
+
+                # Only show target when print is active
+                # Clear remembered target when printer is idle
+                if phase == 'idle':
+                    if last_mapping_target != -1:
+                        last_mapping_target = -1
+                    target_tray = -1  # Don't show target when idle
+                elif target_tray == -1 and last_mapping_target != -1:
+                    # If mapping not in this message but print is active, use remembered value
+                    target_tray = last_mapping_target
+
+                if 'ams' in print_data:
+                    ams_data = print_data['ams']
+                    if isinstance(ams_data, dict):
+                        # Get current tray (which slot is loaded in toolhead)
+                        tray_now_value = ams_data.get('tray_now', None)
+                        if tray_now_value is not None:
+                            if isinstance(tray_now_value, str):
+                                try:
+                                    current_tray = int(tray_now_value)
+                                except ValueError:
+                                    pass  # Keep previous value
+                            else:
+                                current_tray = tray_now_value
+                            # Save to global
+                            last_tray_now = current_tray
+
+                        # Note: We no longer fall back to tray_tar as it causes flickering
+                        # The remembered mapping target is used instead (set above)
+
+                        if 'ams' in ams_data and len(ams_data['ams']) > 0:
+                            try:
+                                ams_unit = ams_data['ams'][0]
+                                if 'tray' in ams_unit:
+                                    for i, tray in enumerate(ams_unit['tray'][:4]):
+                                        slot_type = tray.get('tray_type', '')
+                                        if slot_type:  # Only update if we got actual data
+                                            ams_slots_data[i] = slot_type
+                                    # Save to global
+                                    last_ams_slots = ams_slots_data[:]
+                            except (IndexError, KeyError, TypeError):
+                                pass
+                if 'vt_tray' in print_data:
+                    vt_tray = print_data['vt_tray']
+                    if isinstance(vt_tray, dict):
+                        ext_type = vt_tray.get('tray_type', '')
+                        if ext_type:  # Only update if we got actual data
+                            external_spool_data = ext_type
+                            last_external_spool = ext_type
+
+                with printer_lock:
+                    status_data['ams_slots'] = ams_slots_data
+                    status_data['external_spool'] = external_spool_data
+                    status_data['tray_now'] = current_tray
+                    status_data['tray_tar'] = target_tray
 
                 # DETECT PRINT START AND AUTO-START HEATER
                 auto_start_enabled = current_settings.get('auto_start_enabled', True)
@@ -1491,9 +1690,9 @@ def printer_monitor():
 
     # Create MQTT client (handle both paho-mqtt 1.x and 2.x APIs)
     try:
-        # Try paho-mqtt 2.0+ API first
-        printer_mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=f"heater_controller_{int(time.time())}")
-        print("Using paho-mqtt 2.x API")
+        # Try paho-mqtt 2.0+ API with VERSION2 (recommended)
+        printer_mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"heater_controller_{int(time.time())}")
+        print("Using paho-mqtt 2.x API (VERSION2)")
     except (AttributeError, TypeError):
         # Fall back to paho-mqtt 1.x API
         printer_mqtt_client = mqtt.Client(client_id=f"heater_controller_{int(time.time())}")
@@ -2066,6 +2265,175 @@ HTML_TEMPLATE = """
             width: auto;
             cursor: pointer;
         }
+
+        /* Connection status dot */
+        .connection-dot {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+        .connection-dot.connected { background: #4CAF50; }
+        .connection-dot.disconnected { background: #f44336; }
+
+        /* AMS Slot Buttons */
+        .ams-slot-btn {
+            padding: 10px 14px;
+            border: 2px solid var(--border-color, #ccc);
+            border-radius: 8px;
+            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: bold;
+            transition: all 0.2s;
+            min-width: 75px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        body.dark .ams-slot-btn {
+            background: linear-gradient(135deg, #3a3a3a 0%, #2a2a2a 100%);
+            border-color: #555;
+        }
+        .ams-slot-btn:hover {
+            border-color: var(--primary-color);
+            background: var(--primary-color);
+            color: white;
+            transform: translateY(-1px);
+            box-shadow: 0 3px 6px rgba(0,0,0,0.15);
+        }
+        .ams-slot-btn.external {
+            min-width: 130px;
+        }
+        .ams-slot-btn.has-override {
+            border-color: #ff9800;
+            background: linear-gradient(135deg, #fff8e1 0%, #ffecb3 100%);
+        }
+        body.dark .ams-slot-btn.has-override {
+            background: linear-gradient(135deg, #4a3d20 0%, #3d3020 100%);
+        }
+        /* Active slot - currently loaded in toolhead (green) */
+        .ams-slot-btn.loaded {
+            border-color: #4CAF50;
+            background: linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%);
+            box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.3), 0 2px 4px rgba(0,0,0,0.1);
+        }
+        body.dark .ams-slot-btn.loaded {
+            background: linear-gradient(135deg, #1b3d1c 0%, #2e5830 100%);
+            box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.4), 0 2px 4px rgba(0,0,0,0.2);
+        }
+        .ams-slot-btn.loaded::after {
+            content: " ●";
+            color: #4CAF50;
+        }
+        /* Target slot - what the print job will use (blue) */
+        .ams-slot-btn.target {
+            border-color: #2196F3;
+            background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
+            box-shadow: 0 0 0 3px rgba(33, 150, 243, 0.3), 0 2px 4px rgba(0,0,0,0.1);
+        }
+        body.dark .ams-slot-btn.target {
+            background: linear-gradient(135deg, #1a3a52 0%, #1e4976 100%);
+            box-shadow: 0 0 0 3px rgba(33, 150, 243, 0.4), 0 2px 4px rgba(0,0,0,0.2);
+        }
+        .ams-slot-btn.target::after {
+            content: " ▶";
+            color: #2196F3;
+        }
+        /* When both loaded AND target (same slot) */
+        .ams-slot-btn.loaded.target {
+            border-color: #4CAF50;
+            background: linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%);
+            box-shadow: 0 0 0 3px rgba(76, 175, 80, 0.4), 0 2px 4px rgba(0,0,0,0.1);
+        }
+        body.dark .ams-slot-btn.loaded.target {
+            background: linear-gradient(135deg, #1b3d1c 0%, #2e5830 100%);
+        }
+        .ams-slot-btn.loaded.target::after {
+            content: " ●▶";
+            color: #4CAF50;
+        }
+
+        /* Floating Camera PiP Window */
+        .camera-pip {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 320px;
+            background: var(--card-bg, white);
+            border-radius: 10px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            z-index: 1500;
+            overflow: hidden;
+            resize: both;
+            min-width: 200px;
+            min-height: 150px;
+        }
+        .camera-pip.hidden {
+            display: none;
+        }
+        .camera-pip.minimized {
+            width: 150px !important;
+            height: auto !important;
+            resize: none;
+        }
+        .camera-pip.minimized .camera-pip-content {
+            display: none;
+        }
+        .camera-pip.large {
+            width: 640px;
+        }
+        .camera-pip-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 12px;
+            background: var(--primary-color);
+            color: white;
+            cursor: move;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        .camera-pip-controls {
+            display: flex;
+            gap: 5px;
+        }
+        .pip-btn {
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            width: 24px;
+            height: 24px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .pip-btn:hover {
+            background: rgba(255,255,255,0.4);
+        }
+        .pip-btn.close:hover {
+            background: #f44336;
+        }
+        .camera-pip-content {
+            background: #000;
+        }
+        .camera-pip-content img {
+            display: block;
+        }
+
+        /* Button danger style */
+        .button.danger {
+            background: #f44336;
+            color: white;
+        }
+        .button.danger:hover {
+            background: #d32f2f;
+        }
+        .button.danger:disabled {
+            background: #999;
+        }
     </style>
 
     <!-- Socket.IO Client Library for WebSocket communication -->
@@ -2174,9 +2542,69 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
+            <div class="settings-section">
+                <h3>🖨️ Printer Integration</h3>
+                <div class="settings-row">
+                    <label>Enable Printer Integration</label>
+                    <input type="checkbox" id="printer-enabled-toggle">
+                </div>
+                <div class="settings-row">
+                    <label>Printer IP Address</label>
+                    <input type="text" id="printer-ip" placeholder="192.168.1.253" style="width: 150px;">
+                </div>
+                <div class="settings-row">
+                    <label>LAN Access Code</label>
+                    <input type="password" id="printer-access-code" placeholder="From printer settings" style="width: 150px;">
+                </div>
+                <div class="settings-row">
+                    <label>Printer Serial Number</label>
+                    <input type="text" id="printer-serial" placeholder="00M00A340600040" style="width: 180px;">
+                </div>
+                <div class="settings-row">
+                    <label>Auto-Start Heater on Print</label>
+                    <input type="checkbox" id="auto-start-toggle" checked>
+                </div>
+                <small style="display: block; margin-top: 5px; color: #666;">Automatically start chamber heater when a print begins on the printer</small>
+
+                <button class="button secondary" onclick="testPrinterConnection()" id="test-connection-btn" style="margin-top: 15px; font-size: 12px; width: 100%;">
+                    🔌 Test Connection
+                </button>
+                <div id="test-connection-result" style="margin-top: 8px; font-size: 12px; display: none;"></div>
+            </div>
+
+            <div class="settings-section">
+                <h3>🎨 Material Temperature Settings</h3>
+                <small style="display: block; margin-bottom: 10px; color: #666;">Set chamber temperature and fan settings for each material type</small>
+                <div id="material-mappings-list">
+                    <!-- Will be populated dynamically -->
+                </div>
+                <button class="button secondary" onclick="addMaterialMapping()" style="margin-top: 10px; font-size: 12px;">
+                    ➕ Add Material
+                </button>
+            </div>
+
+            <div class="settings-section">
+                <h3>📦 AMS Slot Overrides</h3>
+                <small style="display: block; margin-bottom: 10px; color: #666;">Manually assign materials to AMS slots if RFID detection fails. Leave blank to auto-detect.</small>
+                <div id="ams-slot-overrides-list">
+                    <!-- Will be populated dynamically -->
+                </div>
+            </div>
+
+            <div class="settings-section">
+                <h3>🧵 External Spool</h3>
+                <div class="settings-row">
+                    <label>External Spool Material</label>
+                    <select id="external-spool-material" style="width: 150px;">
+                        <option value="">Auto-detect</option>
+                    </select>
+                </div>
+                <small style="display: block; margin-top: 5px; color: #666;">Material loaded in the external spool holder (not AMS)</small>
+            </div>
+
             <div style="margin-top: 20px; display: flex; gap: 10px;">
-                <button class="button primary" onclick="saveAdvancedSettings()" style="flex: 1;">
-                    💾 Save Settings
+                <button class="button primary" onclick="saveAllSettings()" style="flex: 1;">
+                    💾 Save All Settings
                 </button>
                 <button class="button secondary" onclick="closeSettings()" style="flex: 1;">
                     Cancel
@@ -2211,6 +2639,67 @@ HTML_TEMPLATE = """
     <div id="notification-toast" class="notification-toast" onclick="dismissNotification()">
         <h3 id="notification-title">Notification</h3>
         <p id="notification-body">Message here</p>
+    </div>
+
+    <!-- Floating Camera PiP Window -->
+    <div id="camera-pip" class="camera-pip hidden">
+        <div class="camera-pip-header">
+            <span>📷 Camera</span>
+            <div class="camera-pip-controls">
+                <button onclick="resetCameraPosition()" title="Reset Position" class="pip-btn">⌂</button>
+                <button onclick="resizeCamera()" title="Resize" class="pip-btn">⤢</button>
+                <button onclick="minimizeCamera()" title="Minimize" class="pip-btn">─</button>
+                <button onclick="closeCamera()" title="Close" class="pip-btn close">✕</button>
+            </div>
+        </div>
+        <div class="camera-pip-content">
+            <img id="camera-feed" src="" alt="Camera Feed" style="width: 100%; height: auto; display: none;">
+            <div id="camera-placeholder" style="display: flex; align-items: center; justify-content: center; height: 180px; color: #666;">
+                Loading camera...
+            </div>
+        </div>
+    </div>
+
+    <!-- AMS Slot Editor Modal -->
+    <div id="ams-editor-modal" class="modal">
+        <div class="modal-content" style="max-width: 350px;">
+            <div class="modal-header">
+                <h2 id="ams-editor-title">Edit AMS Slot</h2>
+                <button class="close" onclick="closeAmsEditor()">&times;</button>
+            </div>
+
+            <div style="margin-bottom: 15px; padding: 10px; background: var(--card-bg, #f0f0f0); border-radius: 5px;">
+                <div style="font-size: 12px; color: #666;">Auto-detected from printer:</div>
+                <div id="ams-auto-detected" style="font-weight: bold;">--</div>
+            </div>
+
+            <div class="settings-row" style="margin-bottom: 15px;">
+                <label>Material Override</label>
+                <select id="ams-editor-material" style="width: 120px;">
+                    <option value="">Auto-detect</option>
+                </select>
+            </div>
+
+            <div id="ams-material-settings" style="padding: 10px; background: var(--card-bg, #f0f0f0); border-radius: 5px; margin-bottom: 15px;">
+                <div style="font-size: 12px; color: #666; margin-bottom: 8px;">Chamber Settings for this Material</div>
+                <div class="settings-row" style="margin-bottom: 8px;">
+                    <label>Temperature</label>
+                    <input type="number" id="ams-editor-temp" style="width: 70px;" min="0" max="100" value="0">°C
+                </div>
+                <div class="settings-row">
+                    <label>Fans Enabled</label>
+                    <input type="checkbox" id="ams-editor-fans">
+                </div>
+            </div>
+
+            <input type="hidden" id="ams-editor-slot">
+            <input type="hidden" id="ams-editor-is-external">
+
+            <div style="display: flex; gap: 10px;">
+                <button class="button primary" onclick="saveAmsSlot()" style="flex: 1;">💾 Save</button>
+                <button class="button secondary" onclick="closeAmsEditor()" style="flex: 1;">Cancel</button>
+            </div>
+        </div>
     </div>
 
     <div class="grid">
@@ -2351,6 +2840,51 @@ HTML_TEMPLATE = """
             <ul class="sensor-list" id="sensor-list"></ul>
         </div>
 
+        <!-- Printer Status Card -->
+        <div class="card" id="printer-card">
+            <h2>🖨️ Printer Status</h2>
+            <div id="printer-connection-status" style="margin-bottom: 10px;">
+                <span class="connection-dot disconnected"></span>
+                <span id="printer-connection-text">Not configured</span>
+            </div>
+
+            <div id="printer-print-info" style="margin-bottom: 15px; padding: 10px; background: var(--card-bg, #f0f0f0); border-radius: 5px;">
+                <div style="font-size: 12px; color: #666;">Current Print</div>
+                <div id="printer-file-name" style="font-weight: bold; word-break: break-all;">No active print</div>
+                <div id="printer-progress-container" style="margin-top: 8px; display: none;">
+                    <div style="display: flex; justify-content: space-between; font-size: 12px;">
+                        <span id="printer-material-display">--</span>
+                        <span id="printer-time-remaining">--</span>
+                    </div>
+                    <div style="background: #ddd; border-radius: 3px; height: 8px; margin-top: 4px;">
+                        <div id="printer-progress-bar" style="background: #4CAF50; height: 100%; border-radius: 3px; width: 0%; transition: width 0.3s;"></div>
+                    </div>
+                    <div id="printer-progress-text" style="text-align: center; font-size: 11px; margin-top: 2px;">0%</div>
+                </div>
+            </div>
+
+            <div style="margin-bottom: 10px;">
+                <div style="font-size: 12px; color: #666; margin-bottom: 5px;">📦 AMS Slots (click to configure)</div>
+                <div id="ams-slots-display" style="display: flex; gap: 5px; flex-wrap: wrap;">
+                    <button class="ams-slot-btn" onclick="openAmsSlotEditor(0)">1: --</button>
+                    <button class="ams-slot-btn" onclick="openAmsSlotEditor(1)">2: --</button>
+                    <button class="ams-slot-btn" onclick="openAmsSlotEditor(2)">3: --</button>
+                    <button class="ams-slot-btn" onclick="openAmsSlotEditor(3)">4: --</button>
+                </div>
+            </div>
+
+            <div style="margin-bottom: 15px;">
+                <div style="font-size: 12px; color: #666; margin-bottom: 5px;">🧵 External Spool</div>
+                <button class="ams-slot-btn external" onclick="openExternalSpoolEditor()" id="external-spool-btn">External: --</button>
+            </div>
+
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button class="button secondary" onclick="toggleCamera()" id="camera-toggle-btn" style="font-size: 12px;">
+                    📷 Camera
+                </button>
+            </div>
+        </div>
+
         <!-- Temperature Graph -->
         <div class="card full-width">
             <h2>Temperature History</h2>
@@ -2445,6 +2979,9 @@ HTML_TEMPLATE = """
 
             // Populate probe names
             populateProbeNames();
+
+            // Populate printer integration settings
+            populatePrinterSettings();
 
             document.getElementById('settings-modal').style.display = 'block';
         }
@@ -2544,6 +3081,752 @@ HTML_TEMPLATE = """
             } catch (e) {
                 console.error('Failed to save advanced settings:', e);
             }
+        }
+
+        // Known materials for dropdowns
+        const knownMaterials = ['PLA', 'ABS', 'ASA', 'PETG', 'PC', 'TPU', 'NYLON', 'HIPS'];
+
+        function populatePrinterSettings() {
+            fetch('/get_settings')
+                .then(response => response.json())
+                .then(settings => {
+                    // Printer connection settings
+                    document.getElementById('printer-enabled-toggle').checked = settings.printer_enabled || false;
+                    document.getElementById('printer-ip').value = settings.printer_ip || '';
+                    document.getElementById('printer-access-code').value = settings.printer_access_code || '';
+                    document.getElementById('printer-serial').value = settings.printer_serial || '';
+                    document.getElementById('auto-start-toggle').checked = settings.auto_start_enabled !== false;
+
+                    // Material mappings
+                    populateMaterialMappings(settings.material_mappings || {});
+
+                    // AMS slot overrides
+                    populateAmsSlotOverrides(settings.ams_slot_overrides || {});
+
+                    // External spool
+                    populateExternalSpool(settings.external_spool_material || '');
+                });
+        }
+
+        function populateMaterialMappings(mappings) {
+            const container = document.getElementById('material-mappings-list');
+            container.innerHTML = '';
+
+            Object.entries(mappings).forEach(([material, config]) => {
+                const div = document.createElement('div');
+                div.className = 'material-mapping-row';
+                div.style.cssText = 'display: flex; gap: 10px; align-items: center; margin-bottom: 8px; padding: 8px; background: var(--card-bg, #f5f5f5); border-radius: 4px;';
+                div.innerHTML = `
+                    <input type="text" class="material-name" value="${material}" style="width: 70px; font-weight: bold;" placeholder="Material">
+                    <label style="font-size: 12px;">Temp:</label>
+                    <input type="number" class="material-temp" value="${config.temp}" style="width: 60px;" min="0" max="100">°C
+                    <label style="font-size: 12px; margin-left: 10px;">
+                        <input type="checkbox" class="material-fans" ${config.fans ? 'checked' : ''}> Fans
+                    </label>
+                    <button onclick="this.parentElement.remove()" style="margin-left: auto; background: #ff4444; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer;">✕</button>
+                `;
+                container.appendChild(div);
+            });
+        }
+
+        function addMaterialMapping() {
+            const container = document.getElementById('material-mappings-list');
+            const div = document.createElement('div');
+            div.className = 'material-mapping-row';
+            div.style.cssText = 'display: flex; gap: 10px; align-items: center; margin-bottom: 8px; padding: 8px; background: var(--card-bg, #f5f5f5); border-radius: 4px;';
+            div.innerHTML = `
+                <input type="text" class="material-name" value="" style="width: 70px; font-weight: bold;" placeholder="Material">
+                <label style="font-size: 12px;">Temp:</label>
+                <input type="number" class="material-temp" value="50" style="width: 60px;" min="0" max="100">°C
+                <label style="font-size: 12px; margin-left: 10px;">
+                    <input type="checkbox" class="material-fans" checked> Fans
+                </label>
+                <button onclick="this.parentElement.remove()" style="margin-left: auto; background: #ff4444; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer;">✕</button>
+            `;
+            container.appendChild(div);
+        }
+
+        function populateAmsSlotOverrides(overrides) {
+            const container = document.getElementById('ams-slot-overrides-list');
+            container.innerHTML = '';
+
+            for (let slot = 0; slot < 4; slot++) {
+                const currentValue = overrides[String(slot)] || '';
+                const div = document.createElement('div');
+                div.className = 'settings-row';
+                div.style.marginBottom = '8px';
+
+                let options = '<option value="">Auto-detect</option>';
+                knownMaterials.forEach(mat => {
+                    options += `<option value="${mat}" ${currentValue === mat ? 'selected' : ''}>${mat}</option>`;
+                });
+
+                div.innerHTML = `
+                    <label>Slot ${slot + 1}</label>
+                    <select id="ams-slot-${slot}" style="width: 120px;">
+                        ${options}
+                    </select>
+                `;
+                container.appendChild(div);
+            }
+        }
+
+        function populateExternalSpool(currentMaterial) {
+            const select = document.getElementById('external-spool-material');
+            select.innerHTML = '<option value="">Auto-detect</option>';
+
+            knownMaterials.forEach(mat => {
+                const option = document.createElement('option');
+                option.value = mat;
+                option.textContent = mat;
+                if (currentMaterial === mat) option.selected = true;
+                select.appendChild(option);
+            });
+        }
+
+        function collectMaterialMappings() {
+            const mappings = {};
+            const rows = document.querySelectorAll('#material-mappings-list .material-mapping-row');
+            rows.forEach(row => {
+                const name = row.querySelector('.material-name').value.trim().toUpperCase();
+                const temp = parseInt(row.querySelector('.material-temp').value) || 0;
+                const fans = row.querySelector('.material-fans').checked;
+                if (name) {
+                    mappings[name] = { temp, fans };
+                }
+            });
+            return mappings;
+        }
+
+        function collectAmsSlotOverrides() {
+            const overrides = {};
+            for (let slot = 0; slot < 4; slot++) {
+                const select = document.getElementById(`ams-slot-${slot}`);
+                if (select) {
+                    overrides[String(slot)] = select.value;
+                }
+            }
+            return overrides;
+        }
+
+        async function saveAllSettings() {
+            // First save advanced settings (display, temp unit, etc.)
+            tempUnit = document.querySelector('input[name="temp-unit"]:checked').value;
+            localStorage.setItem('tempUnit', tempUnit);
+
+            const hysteresis = document.getElementById('hysteresis').value;
+            localStorage.setItem('hysteresis', hysteresis);
+
+            const cooldownHours = document.getElementById('cooldown-hours').value;
+            localStorage.setItem('cooldownHours', cooldownHours);
+
+            const cooldownTargetTemp = document.getElementById('cooldown-target-temp').value;
+            localStorage.setItem('cooldownTargetTemp', cooldownTargetTemp);
+
+            const requirePreheatConfirmation = document.getElementById('require-preheat-confirmation').checked;
+            localStorage.setItem('requirePreheatConfirmation', requirePreheatConfirmation);
+
+            const skipPreheat = document.getElementById('skip-preheat').checked;
+            localStorage.setItem('skipPreheat', skipPreheat);
+
+            // Collect probe names
+            const probeNames = {};
+            sensorIds.forEach(id => {
+                const input = document.getElementById(`probe-name-${id}`);
+                if (input) {
+                    probeNames[id] = input.value;
+                }
+            });
+
+            try {
+                // Save advanced settings
+                await fetch('/save_advanced_settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        hysteresis: parseFloat(hysteresis),
+                        cooldown_hours: parseFloat(cooldownHours),
+                        cooldown_target_temp: parseFloat(cooldownTargetTemp),
+                        require_preheat_confirmation: requirePreheatConfirmation,
+                        skip_preheat: skipPreheat,
+                        probe_names: probeNames,
+                        temp_unit: tempUnit
+                    })
+                });
+
+                // Save printer settings
+                const printerSettings = {
+                    printer_enabled: document.getElementById('printer-enabled-toggle').checked,
+                    printer_ip: document.getElementById('printer-ip').value,
+                    printer_access_code: document.getElementById('printer-access-code').value,
+                    printer_serial: document.getElementById('printer-serial').value,
+                    auto_start_enabled: document.getElementById('auto-start-toggle').checked,
+                    material_mappings: collectMaterialMappings(),
+                    ams_slot_overrides: collectAmsSlotOverrides(),
+                    external_spool_material: document.getElementById('external-spool-material').value
+                };
+
+                const response = await fetch('/save_printer_settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(printerSettings)
+                });
+
+                const result = await response.json();
+                if (result.success) {
+                    showNotification('Settings Saved', 'All settings saved successfully');
+                    closeSettings();
+                    updateTempLabels();
+                    // Reload to apply printer settings changes
+                    location.reload();
+                }
+            } catch (e) {
+                console.error('Failed to save settings:', e);
+                showNotification('Error', 'Failed to save settings');
+            }
+        }
+
+        // ========== PRINTER STATUS CARD FUNCTIONS ==========
+
+        // Store current settings for AMS editor
+        let currentAmsSlots = ['', '', '', ''];
+        let currentExternalSpool = '';
+        let currentTrayNow = -1;  // -1 = unknown, 0-3 = AMS slot, 255 = external (currently loaded)
+        let currentTrayTar = -1;  // Target tray for print job (what the print needs)
+        let currentMaterialMappings = {};
+        let currentAmsOverrides = {};
+
+        function updatePrinterStatusCard(data) {
+            // Update connection status
+            const connDot = document.querySelector('#printer-connection-status .connection-dot');
+            const connText = document.getElementById('printer-connection-text');
+
+            if (data.printer_connected) {
+                connDot.className = 'connection-dot connected';
+                connText.textContent = 'Connected';
+            } else {
+                connDot.className = 'connection-dot disconnected';
+                connText.textContent = 'Not connected';
+            }
+
+            // Update print info
+            const fileName = document.getElementById('printer-file-name');
+            const progressContainer = document.getElementById('printer-progress-container');
+            const materialDisplay = document.getElementById('printer-material-display');
+            const timeRemaining = document.getElementById('printer-time-remaining');
+            const progressBar = document.getElementById('printer-progress-bar');
+            const progressText = document.getElementById('printer-progress-text');
+
+            if (data.printer_phase === 'printing' || data.printer_phase === 'paused') {
+                fileName.textContent = data.printer_file || 'Unknown file';
+                progressContainer.style.display = 'block';
+                materialDisplay.textContent = data.printer_material || '--';
+                const minutes = Math.floor((data.printer_time_remaining || 0) / 60);
+                const hours = Math.floor(minutes / 60);
+                const mins = minutes % 60;
+                timeRemaining.textContent = hours > 0 ? `${hours}h ${mins}m left` : `${mins}m left`;
+                progressBar.style.width = (data.printer_progress || 0) + '%';
+                progressText.textContent = (data.printer_progress || 0) + '%';
+            } else {
+                fileName.textContent = 'No active print';
+                progressContainer.style.display = 'none';
+            }
+
+            // Update tray_now (currently loaded slot) and tray_tar (target for print)
+            if (data.tray_now !== undefined) {
+                currentTrayNow = data.tray_now;
+            }
+            if (data.tray_tar !== undefined) {
+                currentTrayTar = data.tray_tar;
+            }
+
+            // Update AMS slots display
+            if (data.ams_slots) {
+                currentAmsSlots = data.ams_slots;
+                updateAmsSlotButtons();
+            }
+
+            // Update external spool display
+            if (data.external_spool !== undefined) {
+                currentExternalSpool = data.external_spool;
+                updateExternalSpoolButton();
+            }
+        }
+
+        // Cache for last known state to prevent unnecessary DOM updates
+        let lastAmsState = { slots: [], trayNow: -1, trayTar: -1, overrides: {} };
+
+        function updateAmsSlotButtons() {
+            // Check if anything actually changed
+            const stateChanged =
+                JSON.stringify(currentAmsSlots) !== JSON.stringify(lastAmsState.slots) ||
+                currentTrayNow !== lastAmsState.trayNow ||
+                currentTrayTar !== lastAmsState.trayTar;
+
+            if (!stateChanged) return; // Skip update if nothing changed
+
+            // Update cached state
+            lastAmsState.slots = [...currentAmsSlots];
+            lastAmsState.trayNow = currentTrayNow;
+            lastAmsState.trayTar = currentTrayTar;
+
+            // Get existing buttons or create new ones
+            const container = document.getElementById('ams-slots-display');
+            let buttons = container.querySelectorAll('.ams-slot-btn:not(.external)');
+
+            // Create buttons if they don't exist
+            if (buttons.length === 0) {
+                container.innerHTML = '';
+                for (let i = 0; i < 4; i++) {
+                    const btn = document.createElement('button');
+                    btn.className = 'ams-slot-btn';
+                    btn.dataset.slot = i;
+                    btn.onclick = () => openAmsSlotEditor(i);
+                    container.appendChild(btn);
+                }
+                buttons = container.querySelectorAll('.ams-slot-btn:not(.external)');
+            }
+
+            // Update each button in place
+            buttons.forEach((btn, i) => {
+                const override = currentAmsOverrides[String(i)] || '';
+                const detected = currentAmsSlots[i] || '';
+                const display = override || detected || 'Empty';
+
+                btn.textContent = `${i + 1}: ${display}`;
+
+                // Update classes
+                btn.classList.remove('has-override', 'loaded', 'target');
+                if (override) btn.classList.add('has-override');
+                if (currentTrayNow >= 0 && currentTrayNow < 4 && currentTrayNow === i) {
+                    btn.classList.add('loaded');
+                }
+                if (currentTrayTar >= 0 && currentTrayTar < 4 && currentTrayTar === i) {
+                    btn.classList.add('target');
+                }
+            });
+        }
+
+        // Fetch overrides once on page load and when settings change
+        function refreshAmsOverrides() {
+            fetch('/get_settings').then(r => r.json()).then(settings => {
+                currentMaterialMappings = settings.material_mappings || {};
+                currentAmsOverrides = settings.ams_slot_overrides || {};
+                currentAmsOverrides['external'] = settings.external_spool_material || '';
+                lastAmsState.overrides = {...currentAmsOverrides};
+                // Force redraw of both AMS slots and external spool
+                lastAmsState.slots = [];
+                lastExternalState.spool = '';
+                updateAmsSlotButtons();
+                updateExternalSpoolButton();
+            });
+        }
+
+        let lastExternalState = { spool: '', trayNow: -1, trayTar: -1 };
+
+        function updateExternalSpoolButton() {
+            // Check if anything changed
+            const stateChanged =
+                currentExternalSpool !== lastExternalState.spool ||
+                currentTrayNow !== lastExternalState.trayNow ||
+                currentTrayTar !== lastExternalState.trayTar;
+
+            if (!stateChanged) return;
+
+            lastExternalState.spool = currentExternalSpool;
+            lastExternalState.trayNow = currentTrayNow;
+            lastExternalState.trayTar = currentTrayTar;
+
+            const externalOverride = currentAmsOverrides['external'] || '';
+            const display = externalOverride || currentExternalSpool || 'Auto';
+
+            const btn = document.getElementById('external-spool-btn');
+            btn.textContent = `External: ${display}`;
+
+            // Clear previous states
+            btn.classList.remove('has-override', 'loaded', 'target');
+
+            if (externalOverride) {
+                btn.classList.add('has-override');
+            }
+
+            // Highlight if external spool is currently loaded (green)
+            if (currentTrayNow === 255) {
+                btn.classList.add('loaded');
+            }
+
+            // Highlight if external spool is target for print (blue)
+            if (currentTrayTar === 255) {
+                btn.classList.add('target');
+            }
+        }
+
+        // ========== AMS SLOT EDITOR FUNCTIONS ==========
+
+        function openAmsSlotEditor(slotIndex) {
+            fetch('/get_settings').then(r => r.json()).then(settings => {
+                currentMaterialMappings = settings.material_mappings || {};
+                currentAmsOverrides = settings.ams_slot_overrides || {};
+
+                const detected = currentAmsSlots[slotIndex] || 'Unknown';
+                const override = currentAmsOverrides[String(slotIndex)] || '';
+
+                document.getElementById('ams-editor-title').textContent = `Edit AMS Slot ${slotIndex + 1}`;
+                document.getElementById('ams-auto-detected').textContent = detected || 'Not detected';
+                document.getElementById('ams-editor-slot').value = slotIndex;
+                document.getElementById('ams-editor-is-external').value = 'false';
+
+                // Populate material dropdown
+                const select = document.getElementById('ams-editor-material');
+                select.innerHTML = '<option value="">Auto-detect</option>';
+                knownMaterials.forEach(mat => {
+                    const option = document.createElement('option');
+                    option.value = mat;
+                    option.textContent = mat;
+                    if (override === mat) option.selected = true;
+                    select.appendChild(option);
+                });
+
+                // Show material settings for current material
+                const currentMaterial = override || detected;
+                updateAmsEditorMaterialSettings(currentMaterial);
+
+                // Update settings when material changes
+                select.onchange = () => {
+                    const selected = select.value || detected;
+                    updateAmsEditorMaterialSettings(selected);
+                };
+
+                document.getElementById('ams-editor-modal').style.display = 'block';
+            });
+        }
+
+        function openExternalSpoolEditor() {
+            fetch('/get_settings').then(r => r.json()).then(settings => {
+                currentMaterialMappings = settings.material_mappings || {};
+                const override = settings.external_spool_material || '';
+                const detected = currentExternalSpool || 'Unknown';
+
+                document.getElementById('ams-editor-title').textContent = 'Edit External Spool';
+                document.getElementById('ams-auto-detected').textContent = detected || 'Not detected';
+                document.getElementById('ams-editor-slot').value = '-1';
+                document.getElementById('ams-editor-is-external').value = 'true';
+
+                // Populate material dropdown
+                const select = document.getElementById('ams-editor-material');
+                select.innerHTML = '<option value="">Auto-detect</option>';
+                knownMaterials.forEach(mat => {
+                    const option = document.createElement('option');
+                    option.value = mat;
+                    option.textContent = mat;
+                    if (override === mat) option.selected = true;
+                    select.appendChild(option);
+                });
+
+                // Show material settings
+                const currentMaterial = override || detected;
+                updateAmsEditorMaterialSettings(currentMaterial);
+
+                select.onchange = () => {
+                    const selected = select.value || detected;
+                    updateAmsEditorMaterialSettings(selected);
+                };
+
+                document.getElementById('ams-editor-modal').style.display = 'block';
+            });
+        }
+
+        function updateAmsEditorMaterialSettings(material) {
+            const materialUpper = (material || '').toUpperCase();
+            const config = currentMaterialMappings[materialUpper] || { temp: 0, fans: false };
+
+            document.getElementById('ams-editor-temp').value = config.temp || 0;
+            document.getElementById('ams-editor-fans').checked = config.fans || false;
+        }
+
+        function closeAmsEditor() {
+            document.getElementById('ams-editor-modal').style.display = 'none';
+        }
+
+        async function saveAmsSlot() {
+            const isExternal = document.getElementById('ams-editor-is-external').value === 'true';
+            const slotIndex = document.getElementById('ams-editor-slot').value;
+            const materialOverride = document.getElementById('ams-editor-material').value;
+            const temp = parseInt(document.getElementById('ams-editor-temp').value) || 0;
+            const fans = document.getElementById('ams-editor-fans').checked;
+
+            // Get current settings
+            const settings = await fetch('/get_settings').then(r => r.json());
+
+            // Update material mapping if a material is selected
+            const material = materialOverride || (isExternal ? currentExternalSpool : currentAmsSlots[slotIndex]);
+            if (material) {
+                settings.material_mappings = settings.material_mappings || {};
+                settings.material_mappings[material.toUpperCase()] = { temp, fans };
+            }
+
+            // Update override
+            if (isExternal) {
+                settings.external_spool_material = materialOverride;
+            } else {
+                settings.ams_slot_overrides = settings.ams_slot_overrides || {};
+                settings.ams_slot_overrides[slotIndex] = materialOverride;
+            }
+
+            // Save settings
+            try {
+                await fetch('/save_printer_settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(settings)
+                });
+
+                showNotification('Settings Saved', isExternal ? 'External spool updated' : `AMS Slot ${parseInt(slotIndex) + 1} updated`);
+                closeAmsEditor();
+                // Refresh overrides from server and update buttons
+                refreshAmsOverrides();
+            } catch (e) {
+                console.error('Failed to save:', e);
+                showNotification('Error', 'Failed to save settings');
+            }
+        }
+
+        // ========== CAMERA PIP FUNCTIONS ==========
+
+        let cameraVisible = false;
+        let cameraSize = 'normal'; // normal, large, minimized
+
+        function toggleCamera() {
+            const pip = document.getElementById('camera-pip');
+            if (cameraVisible) {
+                closeCamera();
+            } else {
+                pip.classList.remove('hidden');
+                cameraVisible = true;
+                loadCameraFeed();
+            }
+        }
+
+        function loadCameraFeed() {
+            const img = document.getElementById('camera-feed');
+            const placeholder = document.getElementById('camera-placeholder');
+
+            placeholder.textContent = 'Loading camera...';
+            placeholder.style.display = 'flex';
+            img.style.display = 'none';
+
+            // Set camera feed URL
+            img.src = '/printer/camera/feed?' + new Date().getTime();
+            img.onload = () => {
+                placeholder.style.display = 'none';
+                img.style.display = 'block';
+            };
+            img.onerror = () => {
+                placeholder.textContent = 'Camera unavailable';
+                placeholder.style.display = 'flex';
+                img.style.display = 'none';
+            };
+        }
+
+        function closeCamera() {
+            const pip = document.getElementById('camera-pip');
+            pip.classList.add('hidden');
+            cameraVisible = false;
+
+            // Stop loading camera
+            document.getElementById('camera-feed').src = '';
+        }
+
+        function minimizeCamera() {
+            const pip = document.getElementById('camera-pip');
+            if (pip.classList.contains('minimized')) {
+                pip.classList.remove('minimized');
+                loadCameraFeed();
+            } else {
+                pip.classList.add('minimized');
+                document.getElementById('camera-feed').src = '';
+            }
+        }
+
+        function resizeCamera() {
+            const pip = document.getElementById('camera-pip');
+            pip.classList.remove('minimized');
+            if (pip.classList.contains('large')) {
+                pip.classList.remove('large');
+                cameraSize = 'normal';
+            } else {
+                pip.classList.add('large');
+                cameraSize = 'large';
+            }
+        }
+
+        // Make camera PiP draggable with bounds checking and touch support
+        (function() {
+            const pip = document.getElementById('camera-pip');
+            if (!pip) return;
+
+            const header = pip.querySelector('.camera-pip-header');
+            let isDragging = false;
+            let offsetX, offsetY;
+
+            function startDrag(clientX, clientY) {
+                isDragging = true;
+                offsetX = clientX - pip.offsetLeft;
+                offsetY = clientY - pip.offsetTop;
+                pip.style.cursor = 'grabbing';
+            }
+
+            function doDrag(clientX, clientY) {
+                if (!isDragging) return;
+
+                // Calculate new position
+                let newX = clientX - offsetX;
+                let newY = clientY - offsetY;
+
+                // Get window and pip dimensions
+                const pipRect = pip.getBoundingClientRect();
+                const minVisible = 50; // Minimum visible pixels on each edge
+
+                // Bounds checking - keep at least minVisible pixels on screen
+                const maxX = window.innerWidth - minVisible;
+                const maxY = window.innerHeight - minVisible;
+                const minX = minVisible - pipRect.width;
+                const minY = 0; // Don't allow dragging above viewport
+
+                newX = Math.max(minX, Math.min(newX, maxX));
+                newY = Math.max(minY, Math.min(newY, maxY));
+
+                pip.style.left = newX + 'px';
+                pip.style.top = newY + 'px';
+                pip.style.right = 'auto';
+                pip.style.bottom = 'auto';
+            }
+
+            function endDrag() {
+                isDragging = false;
+                pip.style.cursor = '';
+            }
+
+            // Mouse events
+            header.addEventListener('mousedown', (e) => {
+                if (e.target.classList.contains('pip-btn')) return;
+                startDrag(e.clientX, e.clientY);
+            });
+
+            document.addEventListener('mousemove', (e) => {
+                doDrag(e.clientX, e.clientY);
+            });
+
+            document.addEventListener('mouseup', endDrag);
+
+            // Touch events for mobile
+            header.addEventListener('touchstart', (e) => {
+                if (e.target.classList.contains('pip-btn')) return;
+                e.preventDefault(); // Prevent scrolling while dragging
+                const touch = e.touches[0];
+                startDrag(touch.clientX, touch.clientY);
+            }, { passive: false });
+
+            document.addEventListener('touchmove', (e) => {
+                if (!isDragging) return;
+                e.preventDefault(); // Prevent scrolling while dragging
+                const touch = e.touches[0];
+                doDrag(touch.clientX, touch.clientY);
+            }, { passive: false });
+
+            document.addEventListener('touchend', endDrag);
+            document.addEventListener('touchcancel', endDrag);
+        })();
+
+        // Reset PiP position if it gets lost off-screen
+        function resetCameraPosition() {
+            const pip = document.getElementById('camera-pip');
+            if (pip) {
+                pip.style.left = 'auto';
+                pip.style.top = 'auto';
+                pip.style.right = '20px';
+                pip.style.bottom = '20px';
+            }
+        }
+
+        // ========== PRINTER CONTROL FUNCTIONS ==========
+
+        async function printerPause() {
+            try {
+                const response = await fetch('/printer/pause', { method: 'POST' });
+                const result = await response.json();
+                if (result.success) {
+                    showNotification('Printer', 'Pause command sent');
+                }
+            } catch (e) {
+                console.error('Failed to pause printer:', e);
+            }
+        }
+
+        async function printerStop() {
+            if (!confirm('Are you sure you want to stop the print on the printer?')) return;
+            try {
+                const response = await fetch('/printer/stop', { method: 'POST' });
+                const result = await response.json();
+                if (result.success) {
+                    showNotification('Printer', 'Stop command sent');
+                }
+            } catch (e) {
+                console.error('Failed to stop printer:', e);
+            }
+        }
+
+        // Initialize printer card on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            // Fetch settings and initialize AMS buttons
+            refreshAmsOverrides();
+        });
+
+        // ========== TEST CONNECTION FUNCTION ==========
+
+        async function testPrinterConnection() {
+            const btn = document.getElementById('test-connection-btn');
+            const resultDiv = document.getElementById('test-connection-result');
+
+            const ip = document.getElementById('printer-ip').value;
+            const accessCode = document.getElementById('printer-access-code').value;
+            const serial = document.getElementById('printer-serial').value;
+
+            if (!ip || !accessCode || !serial) {
+                resultDiv.style.display = 'block';
+                resultDiv.style.color = '#f44336';
+                resultDiv.textContent = '⚠️ Please fill in all printer fields';
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = '🔄 Testing...';
+            resultDiv.style.display = 'block';
+            resultDiv.style.color = '#666';
+            resultDiv.textContent = 'Connecting to printer...';
+
+            try {
+                const response = await fetch('/test_printer_connection', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ ip, access_code: accessCode, serial })
+                });
+
+                const result = await response.json();
+                if (result.success) {
+                    resultDiv.style.color = '#4CAF50';
+                    resultDiv.textContent = '✅ ' + result.message;
+                } else {
+                    resultDiv.style.color = '#f44336';
+                    resultDiv.textContent = '❌ ' + result.message;
+                }
+            } catch (e) {
+                resultDiv.style.color = '#f44336';
+                resultDiv.textContent = '❌ Failed to test connection';
+            }
+
+            btn.disabled = false;
+            btn.textContent = '🔌 Test Connection';
         }
 
         function changeTempUnit() {
@@ -3684,6 +4967,9 @@ HTML_TEMPLATE = """
             } else {
                 resumeBanner.style.display = 'none';
             }
+
+            // Update Printer Status Card
+            updatePrinterStatusCard(data);
         });
 
         // Real-time notification events
@@ -3796,6 +5082,117 @@ def save_advanced_settings():
 
     return jsonify({'success': True, 'message': 'Advanced settings saved'})
 
+@app.route('/save_printer_settings', methods=['POST'])
+def save_printer_settings():
+    """Save printer integration and material settings"""
+    global current_settings
+
+    data = request.json
+
+    # Update printer connection settings
+    if 'printer_enabled' in data:
+        current_settings['printer_enabled'] = data['printer_enabled']
+    if 'printer_ip' in data:
+        current_settings['printer_ip'] = data['printer_ip']
+    if 'printer_access_code' in data:
+        current_settings['printer_access_code'] = data['printer_access_code']
+    if 'printer_serial' in data:
+        current_settings['printer_serial'] = data['printer_serial']
+    if 'auto_start_enabled' in data:
+        current_settings['auto_start_enabled'] = data['auto_start_enabled']
+
+    # Update material mappings
+    if 'material_mappings' in data:
+        current_settings['material_mappings'] = data['material_mappings']
+
+    # Update AMS slot overrides
+    if 'ams_slot_overrides' in data:
+        current_settings['ams_slot_overrides'] = data['ams_slot_overrides']
+
+    # Update external spool material
+    if 'external_spool_material' in data:
+        current_settings['external_spool_material'] = data['external_spool_material']
+
+    save_settings(current_settings)
+
+    return jsonify({'success': True, 'message': 'Printer settings saved'})
+
+@app.route('/test_printer_connection', methods=['POST'])
+def test_printer_connection():
+    """Test printer MQTT connection with provided credentials"""
+    import socket
+    import ssl
+
+    data = request.json
+    ip = data.get('ip', '')
+    access_code = data.get('access_code', '')
+    serial = data.get('serial', '')
+
+    if not ip or not access_code or not serial:
+        return jsonify({'success': False, 'message': 'Missing required fields'})
+
+    # Test basic TCP connectivity first
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        result = sock.connect_ex((ip, 8883))
+        sock.close()
+
+        if result != 0:
+            return jsonify({'success': False, 'message': f'Cannot reach printer at {ip}:8883'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Network error: {str(e)}'})
+
+    # Test MQTT connection
+    try:
+        import paho.mqtt.client as mqtt
+        connected = {'status': None}
+
+        def on_connect(client, userdata, flags, rc, *args):
+            if rc == 0:
+                connected['status'] = 'success'
+            elif rc == 5:
+                connected['status'] = 'auth_failed'
+            else:
+                connected['status'] = f'error_{rc}'
+
+        # Create temporary client for testing
+        try:
+            # Try paho-mqtt 2.0+ API with VERSION2 (recommended)
+            test_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"test_{int(time.time())}")
+        except (AttributeError, TypeError):
+            # Fall back to paho-mqtt 1.x API
+            test_client = mqtt.Client(client_id=f"test_{int(time.time())}")
+
+        test_client.username_pw_set("bblp", access_code)
+        test_client.tls_set(cert_reqs=ssl.CERT_NONE)
+        test_client.tls_insecure_set(True)
+        test_client.on_connect = on_connect
+
+        test_client.connect(ip, 8883, keepalive=10)
+        test_client.loop_start()
+
+        # Wait for connection result
+        timeout = 5
+        while connected['status'] is None and timeout > 0:
+            time.sleep(0.5)
+            timeout -= 0.5
+
+        test_client.loop_stop()
+        test_client.disconnect()
+
+        if connected['status'] == 'success':
+            return jsonify({'success': True, 'message': 'Connection successful!'})
+        elif connected['status'] == 'auth_failed':
+            return jsonify({'success': False, 'message': 'Authentication failed - check access code'})
+        elif connected['status'] is None:
+            return jsonify({'success': False, 'message': 'Connection timeout'})
+        else:
+            return jsonify({'success': False, 'message': f'Connection failed: {connected["status"]}'})
+
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'MQTT error: {str(e)}'})
+
 @app.route('/save_preset', methods=['POST'])
 def save_preset():
     preset = request.json
@@ -3837,24 +5234,70 @@ def start():
 
 @app.route('/stop', methods=['POST'])
 def stop():
-    global stop_requested, additional_seconds
+    global stop_requested, additional_seconds, printer_mqtt_client, printer_connected, mqtt_sequence_id
 
     if print_active:
         with state_lock:
             stop_requested = True
             additional_seconds = 0  # Reset time adjustments when stopping
+
+        # Also stop the printer if connected
+        if printer_connected and printer_mqtt_client:
+            try:
+                serial = current_settings.get('printer_serial', '')
+                topic = f"device/{serial}/request"
+                mqtt_sequence_id += 1
+                command = {
+                    "print": {
+                        "sequence_id": str(mqtt_sequence_id),
+                        "command": "stop"
+                    }
+                }
+                printer_mqtt_client.publish(topic, json.dumps(command), qos=1)
+                print(f"🛑 Sent STOP command to printer")
+                return jsonify({'success': True, 'message': 'Print stopped - heater and printer'})
+            except Exception as e:
+                print(f"Error stopping printer: {e}")
+                return jsonify({'success': True, 'message': 'Heater stopped (printer stop failed)'})
+
         return jsonify({'success': True, 'message': 'Print stopped'})
 
     return jsonify({'success': False, 'message': 'No print active'})
 
 @app.route('/pause', methods=['POST'])
 def pause():
-    global pause_requested
+    global pause_requested, printer_mqtt_client, printer_connected, mqtt_sequence_id
 
     if print_active:
+        # Determine if we're pausing or resuming
+        is_pausing = not print_paused
+
         with state_lock:
             pause_requested = True
-        message = 'Pause toggled' if not print_paused else 'Resume toggled'
+
+        # Also pause/resume the printer if connected
+        if printer_connected and printer_mqtt_client:
+            try:
+                serial = current_settings.get('printer_serial', '')
+                topic = f"device/{serial}/request"
+                mqtt_sequence_id += 1
+                command = {
+                    "print": {
+                        "sequence_id": str(mqtt_sequence_id),
+                        "command": "pause" if is_pausing else "resume"
+                    }
+                }
+                printer_mqtt_client.publish(topic, json.dumps(command), qos=1)
+                action = "PAUSE" if is_pausing else "RESUME"
+                print(f"⏸ Sent {action} command to printer")
+                message = f'Print {"paused" if is_pausing else "resumed"} - heater and printer'
+                return jsonify({'success': True, 'message': message})
+            except Exception as e:
+                print(f"Error {'pausing' if is_pausing else 'resuming'} printer: {e}")
+                message = f'Heater {"paused" if is_pausing else "resumed"} (printer command failed)'
+                return jsonify({'success': True, 'message': message})
+
+        message = 'Pause toggled' if is_pausing else 'Resume toggled'
         return jsonify({'success': True, 'message': message})
 
     return jsonify({'success': False, 'message': 'No print active'})

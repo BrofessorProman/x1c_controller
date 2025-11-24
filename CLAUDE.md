@@ -22,10 +22,10 @@ This is a Raspberry Pi-based temperature controller for a 3D printer chamber hea
 - ✅ GPIO state detection on restart - syncs software/hardware state
 - ✅ Fire alarm UI lockdown - comprehensive safety controls during emergency
 - ✅ Print state persistence and crash recovery - resume interrupted prints after crashes or restarts
-- ✅ **Bambu Lab X1C Integration** - MQTT monitoring, control, and camera streaming (v2.8-alpha)
+- ✅ **Bambu Lab X1C Integration** - MQTT monitoring, control, and camera streaming (v3.0)
 - ✅ **Material-Based Auto-Start** - Automatically configures heater when print starts based on detected material
-- ✅ **Printer Control** - Pause/Resume/Stop prints via web interface
-- ✅ **Live Camera Feed** - On-demand streaming from X1C camera
+- ✅ **Printer Control** - Pause/Resume/Stop controls both heater AND printer via MQTT
+- ✅ **Live Camera Feed** - Always-on PiP streaming from X1C camera with drag support
 
 ## Quick Start
 
@@ -460,6 +460,51 @@ All status data is:
 - Updated in real-time via WebSocket (`status_update` event)
 - Thread-safe (protected by `printer_lock`)
 - Available via `/status` API endpoint
+
+#### Available MQTT Parameters (Bambu X1C)
+The printer publishes JSON reports to `device/{SERIAL}/report`. Not all fields are present in every message - use "sticky" values to remember last known state.
+
+**Print Job Fields** (in `print` object):
+| Field | Type | Description |
+|-------|------|-------------|
+| `gcode_state` | string | Print state: `IDLE`, `RUNNING`, `PAUSE`, `FINISH`, `FAILED` |
+| `subtask_name` | string | Print job name (preferred over `gcode_file`) |
+| `gcode_file` | string | Full path to gcode file on printer |
+| `mc_percent` | int | Print progress 0-100 |
+| `mc_remaining_time` | int | Estimated minutes remaining |
+| `remain_time` | int | Alternative time remaining field (fallback) |
+| `mapping` | array | **Slicer's filament slot assignment** - most reliable for material detection (e.g., `[1]` = slot 1) |
+| `vir_slot` | array | Virtual slot info for external spool (255 = external) |
+
+**AMS Fields** (in `print.ams` object):
+| Field | Type | Description |
+|-------|------|-------------|
+| `tray_now` | int/string | Currently loaded tray (0-3, or 255 for external) |
+| `tray_tar` | int | Target tray for filament change (only updates after change starts) |
+| `tray_pre` | int | Previous tray |
+| `ams[0].tray[N].tray_type` | string | Material type in slot N (e.g., `"PLA"`, `"ABS"`, `"PC"`) |
+| `ams[0].tray[N].tray_color` | string | Filament color hex code |
+
+**Temperature Fields** (in `print` object):
+| Field | Type | Description |
+|-------|------|-------------|
+| `nozzle_temper` | float | Current nozzle temperature °C |
+| `nozzle_target_temper` | float | Target nozzle temperature °C |
+| `bed_temper` | float | Current bed temperature °C |
+| `bed_target_temper` | float | Target bed temperature °C |
+| `chamber_temper` | float | Chamber temperature °C (from printer's sensor) |
+
+**Material Detection Priority:**
+1. **`mapping` field** (best) - Contains slicer's filament assignment, available at print start
+2. **`tray_tar`** (fallback) - Target tray, only updates after filament change begins
+3. **`tray_now`** (last resort) - Currently loaded filament, may not match print job
+
+**Important Implementation Notes:**
+- Not all fields are present in every MQTT message
+- Use "sticky" global variables to remember last known values
+- Only update `gcode_state`/phase when field is actually present (prevents flickering)
+- Clear sticky values when printer returns to idle state
+- `mapping[0] = 255` indicates external spool (not from AMS)
 
 #### Printer Control
 Three control commands available via API:
@@ -910,18 +955,18 @@ See `TODO.md` for planned improvements including:
 
 ## Version History
 
-**Current Version**: 2.9-alpha (Bambu Lab X1C Integration - Backend Complete, UI Pending)
+**Current Version**: 3.0 (Bambu Lab X1C Integration - Production Ready)
 
-**⚠️ WORK IN PROGRESS**: Printer integration features are functional but the web UI has not been implemented yet. Users must configure printer settings manually in `heater_settings.json`. UI implementation planned for next release.
+Full Bambu Lab X1C printer integration with real-time MQTT monitoring, material-based auto-start, and comprehensive UI.
 
 - **NEW**: Bambu Lab X1C printer integration via MQTT
   - MQTT client thread connects to printer broker (port 8883, TLS)
   - Real-time monitoring of print status, progress, temperatures
-  - Material detection from AMS tray data or filename
+  - Material detection from AMS tray data using `mapping` field (slicer's filament assignment)
   - Configurable material mappings (temp + fan settings per material)
 - **NEW**: Material-based auto-start automation
   - Detects when print starts on X1C (MQTT state transition)
-  - Identifies material (PC, ABS, ASA, PETG, PLA)
+  - Identifies material (PC, ABS, ASA, PETG, PLA) from slicer's `mapping` field
   - Auto-configures heater: target temp, fans, print duration
   - Triggers heater START automatically (user-configurable)
   - Default mappings: PC (60°C, fans off), ABS/ASA (60-65°C, fans on)
@@ -930,37 +975,40 @@ See `TODO.md` for planned improvements including:
   - Detects `FAILED` state (user cancelled in Bambu Studio) → immediate stop, no cooldown
   - Uses raw `gcode_state` tracking to avoid false triggers from normal state transitions
   - UI buttons lock with processing indicator when backend triggers stop
-- **NEW**: Printer control API endpoints
-  - `/printer/pause` - Pause current print via MQTT
-  - `/printer/resume` - Resume paused print
-  - `/printer/stop` - Stop/cancel print
+- **NEW**: Printer control via web interface
+  - Pause/Resume/Stop buttons control both heater AND printer via MQTT
+  - `/pause` endpoint sends MQTT pause/resume commands to X1C printer
   - MQTT command publishing with sequence ID tracking
 - **NEW**: Always-on camera streaming from X1C
   - Camera starts automatically when printer is configured and enabled
   - Background `camera_monitor` thread manages FFmpeg lifecycle
   - Auto-restarts if FFmpeg dies or stream disconnects
   - Resolution: 720p @ 10fps (~35% CPU on Raspberry Pi 4)
-  - Quality setting: q:v 5 (good balance of quality and performance)
-  - API: `/printer/camera/feed` (always available), `/printer/camera/status`
-  - Removed manual start/stop - camera runs continuously when printer configured
+  - Draggable PiP (Picture-in-Picture) camera overlay with bounds checking
+  - Mobile touch support for PiP dragging
+  - Reset position button (⌂) to restore default location
 - **NEW**: Emergency integration with printer
   - Fire alarm now stops both heater AND printer via MQTT
   - Emergency stop button stops both systems
   - Enhanced safety: dual-system shutdown during emergencies
-- **NEW**: Printer state variables and WebSocket updates
-  - Real-time printer status via WebSocket (phase, file, material, progress, temps)
-  - Thread-safe state management with `printer_lock`
-  - Camera streaming status tracking
-  - Processing lock event for UI button coordination
-- **IMPROVED**: Security - removed hardcoded printer credentials
-  - Default settings now have empty strings for printer_ip, printer_access_code, printer_serial
-  - Users must configure via settings file (UI configuration planned)
-  - Safe for public GitHub repository
-- **NEW**: Documentation for testing and implementation
-  - `PRINTER_TESTING_GUIDE.md` - Comprehensive testing procedures
-  - `IMPLEMENTATION_STATUS.md` - Technical implementation details
-- **STATUS**: Backend complete and tested, UI implementation pending
+- **NEW**: Printer Status UI
+  - Real-time printer status card with phase, file, material, progress
+  - AMS slot buttons showing filament types with visual indicators
+  - Loaded filament highlighted (green), target filament highlighted (blue)
+  - Progress bar with estimated time remaining
+- **NEW**: Anti-flickering system for MQTT data
+  - "Sticky" global variables remember last known values when fields missing from MQTT messages
+  - Only updates `gcode_state`/phase when field is actually present (prevents rapid toggling)
+  - Sticky values for: material, file name, progress, time remaining, AMS slots, tray positions
+  - Clears sticky values when printer returns to idle state
+- **FIXED**: Material detection using correct MQTT field
+  - Uses `mapping` field (slicer's filament assignment) instead of `tray_now` (loaded filament)
+  - Correctly detects print job's target material, not currently loaded material
+- **IMPROVED**: MQTT client updated to paho-mqtt CallbackAPIVersion.VERSION2
+- **NEW**: Comprehensive MQTT parameter documentation in CLAUDE.md
 - All features from version 2.7 and earlier
+
+**Version 2.9-alpha**: (Development version - superseded by 3.0)
 
 **Version 2.7**: (Lights Relay Implementation)
 - **NEW**: GPIO-based lights relay on pin 22 (Physical Pin 15)
