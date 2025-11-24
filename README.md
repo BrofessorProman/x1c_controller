@@ -2,10 +2,10 @@
 
 A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber heating with a modern web interface and Bambu Lab X1C printer integration.
 
-![Status](https://img.shields.io/badge/status-beta-yellow)
+![Status](https://img.shields.io/badge/status-stable-green)
 ![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi-red)
 ![Python](https://img.shields.io/badge/python-3.7+-blue)
-![Version](https://img.shields.io/badge/version-2.8--alpha-blue)
+![Version](https://img.shields.io/badge/version-3.0-blue)
 
 ## Features
 
@@ -31,14 +31,15 @@ A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber
 - 🔄 **GPIO State Sync** - Detects hardware state on service restart
 - 💾 **Crash Recovery** - Resume interrupted prints after crashes or restarts
 
-### Bambu Lab X1C Integration (v2.8-alpha) 🆕
+### Bambu Lab X1C Integration (v3.0) ✅
 - 🖨️ **MQTT Printer Monitoring** - Real-time print status, progress, and temperatures
 - 🤖 **Material-Based Auto-Start** - Automatically configures heater when print starts based on material (PC, ABS, ASA, PETG, PLA)
-- 🎮 **Printer Control** - Pause/Resume/Stop prints via API endpoints
-- 📹 **Live Camera Feed** - On-demand streaming from X1C camera (FFmpeg + RTSPS)
+- 🎮 **Printer Control** - Pause/Resume/Stop controls both heater AND printer via MQTT
+- 📹 **Live Camera Feed** - Always-on PiP streaming with drag support and mobile touch events
 - 🔧 **Configurable Mappings** - Custom temperature and fan settings per material
 - 🚨 **Emergency Integration** - Fire alarm and emergency stop also halt printer
-- ⚙️ **Backend Complete** - Full MQTT integration ready, UI pending
+- 📊 **Printer Status UI** - AMS slot visualization with loaded/target filament highlighting
+- 🔄 **Anti-Flickering** - Stable UI using sticky values for intermittent MQTT data
 
 ## Quick Start
 
@@ -185,12 +186,13 @@ See `PRINTER_TESTING_GUIDE.md` for comprehensive testing procedures.
 
 **Features:**
 - **Auto-Start**: Heater automatically configures when print starts
-- **Material Detection**: Identifies material from AMS or filename
-- **Printer Control**: Pause/Resume/Stop via API
-- **Camera Streaming**: Live feed on-demand
+- **Material Detection**: Uses slicer's `mapping` field for accurate detection
+- **Printer Control**: Pause/Resume/Stop controls both heater and printer
+- **Camera Streaming**: Always-on PiP with drag support
 - **Emergency Integration**: Fire alarm stops both heater and printer
+- **AMS Visualization**: Slot buttons with loaded (green) and target (blue) indicators
 
-**Backend Status:** ✅ Complete | **UI Status:** ⏳ Pending
+**Status:** ✅ Production Ready
 
 ## Usage
 
@@ -430,6 +432,6 @@ Contributions welcome! Please:
 
 ---
 
-**Version**: 2.8-alpha (Bambu Lab X1C Integration - Backend Complete)
-**Status**: Beta - Backend Complete, UI Pending ⏳
-**Last Updated**: 2025-01-15
+**Version**: 3.0 (Bambu Lab X1C Integration - Production Ready)
+**Status**: Stable ✅
+**Last Updated**: 2025-11-23
