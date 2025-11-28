@@ -456,6 +456,15 @@ The `printer_monitor()` thread continuously receives MQTT reports containing:
 - **Material Info**: From AMS or slicer metadata
 - **Connection Status**: MQTT broker connectivity
 
+**Robust MQTT Reconnection System:**
+- **Automatic reconnection**: Exponential backoff (1-120 seconds) prevents connection hammering
+- **Dual-strategy reconnection**:
+  - **Attempt 1 or >5 failures**: Fresh connection via `connect_async()` (handles corrupted socket state)
+  - **Attempts 2-5**: Fast `reconnect()` method for transient failures
+- **Timed retry logic**: Reconnection attempts every 10 seconds (prevents busy-wait)
+- **Clean state management**: Disconnection clears sticky values and resets printer status display
+- **Survives printer power cycles**: Automatically reconnects when printer comes back online (30-60 seconds)
+
 All status data is:
 - Updated in real-time via WebSocket (`status_update` event)
 - Thread-safe (protected by `printer_lock`)
@@ -525,25 +534,33 @@ Commands use MQTT publish to `device/{SERIAL}/request` with format:
 **UI Integration:** Control buttons planned for dashboard (pending UI implementation)
 
 #### Camera Streaming
-On-demand live video feed from X1C camera.
+Always-on live video feed from X1C camera with automatic reconnection.
 
 **Technical Approach:**
 - **Input**: RTSPS (RTSP over SSL) on port 322
-- **SDP File**: Generated dynamically with printer IP and access code
 - **Transcoding**: FFmpeg converts RTSPS → MJPEG for browser compatibility
 - **Output**: MJPEG stream via `/printer/camera/feed` endpoint
-- **Resolution**: 640px width (scaled for Raspberry Pi performance)
-- **Control**: User-initiated start/stop (not continuous)
+- **Resolution**: 1280px width @ 10fps (~35% CPU on Raspberry Pi 4)
+- **Control**: Always-on when printer configured (automatic lifecycle management)
+
+**Robust Reconnection System:**
+- **FFmpeg timeout options**: 10-second connection timeout prevents indefinite hangs
+- **Non-blocking reads**: Uses `select()` with 2-second timeout to check for data availability
+- **Dual-layer watchdog**:
+  - **Outer watchdog**: Kills hung processes before starting new stream
+  - **Inner watchdog**: Detects no frames for 30+ seconds during read loop
+- **Automatic restart**: Detects stream failure and reconnects within 5-30 seconds
+- **Frontend auto-reload**: Browser automatically reloads feed when backend reconnects (no manual refresh)
+- **Survives printer power cycles**: Fully automatic recovery when printer comes back online
 
 **API Endpoints:**
-- **`POST /printer/camera/start`**: Start FFmpeg transcoding process
-- **`POST /printer/camera/stop`**: Terminate FFmpeg, stop streaming
 - **`GET /printer/camera/feed`**: MJPEG stream (multipart/x-mixed-replace)
+- **`GET /printer/camera/status`**: Camera streaming status
 
 **Performance Notes:**
-- Camera transcoding uses ~20-40% CPU on Raspberry Pi 4
-- On-demand design reduces idle resource usage
-- Recommended to stop when not actively monitoring
+- Camera transcoding uses ~35% CPU on Raspberry Pi 4
+- Always-on design for seamless monitoring experience
+- Stream automatically stops/restarts when printer powers off/on
 
 #### Emergency Integration
 **Fire Alarm:** When MQ-2 sensor detects fire, system:
@@ -955,7 +972,32 @@ See `TODO.md` for planned improvements including:
 
 ## Version History
 
-**Current Version**: 3.0 (Bambu Lab X1C Integration - Production Ready)
+**Current Version**: 3.1 (Robust Reconnection System)
+
+Enhanced reliability with automatic MQTT and camera reconnection after printer power cycles.
+
+- **NEW**: Robust MQTT reconnection system
+  - Exponential backoff (1-120 seconds) prevents connection hammering
+  - Dual-strategy reconnection: fresh connection for initial/repeated failures, fast reconnect for transient issues
+  - Timed retry logic (10-second intervals) prevents busy-waiting
+  - Clean state management: disconnection clears sticky values and resets printer status
+  - Survives printer power cycles: automatically reconnects in 30-60 seconds
+- **NEW**: Robust camera stream reconnection
+  - FFmpeg timeout options (10-second connection timeout) prevents indefinite hangs
+  - Non-blocking reads with `select()` (2-second timeout) checks for data availability
+  - Dual-layer watchdog system:
+    - Outer watchdog: kills hung processes before starting new stream
+    - Inner watchdog: detects no frames for 30+ seconds during read loop
+  - Automatic restart after stream failure (5-30 seconds)
+  - Frontend auto-reload: browser automatically reloads feed when backend reconnects (no manual refresh)
+  - Survives printer power cycles: fully automatic recovery
+- **IMPROVED**: Camera streaming always-on when printer configured
+  - Automatic lifecycle management (no user intervention required)
+  - Stream automatically stops/restarts when printer powers off/on
+  - Silent reconnection (no popups, user can continue working)
+- All features from version 3.0
+
+**Version 3.0**: (Bambu Lab X1C Integration - Production Ready)
 
 Full Bambu Lab X1C printer integration with real-time MQTT monitoring, material-based auto-start, and comprehensive UI.
 

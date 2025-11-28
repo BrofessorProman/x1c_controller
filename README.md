@@ -5,7 +5,7 @@ A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber
 ![Status](https://img.shields.io/badge/status-stable-green)
 ![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi-red)
 ![Python](https://img.shields.io/badge/python-3.7+-blue)
-![Version](https://img.shields.io/badge/version-3.0-blue)
+![Version](https://img.shields.io/badge/version-3.1-blue)
 
 ## Features
 
@@ -31,15 +31,17 @@ A comprehensive Raspberry Pi-based temperature controller for 3D printer chamber
 - 🔄 **GPIO State Sync** - Detects hardware state on service restart
 - 💾 **Crash Recovery** - Resume interrupted prints after crashes or restarts
 
-### Bambu Lab X1C Integration (v3.0) ✅
+### Bambu Lab X1C Integration (v3.1) ✅
 - 🖨️ **MQTT Printer Monitoring** - Real-time print status, progress, and temperatures
+- 🔌 **Robust MQTT Reconnection** - Automatic recovery from printer power cycles (30-60s)
 - 🤖 **Material-Based Auto-Start** - Automatically configures heater when print starts based on material (PC, ABS, ASA, PETG, PLA)
 - 🎮 **Printer Control** - Pause/Resume/Stop controls both heater AND printer via MQTT
 - 📹 **Live Camera Feed** - Always-on PiP streaming with drag support and mobile touch events
+- 🔄 **Auto Camera Reconnect** - Stream automatically recovers after printer power cycles (silent, no manual refresh)
 - 🔧 **Configurable Mappings** - Custom temperature and fan settings per material
 - 🚨 **Emergency Integration** - Fire alarm and emergency stop also halt printer
 - 📊 **Printer Status UI** - AMS slot visualization with loaded/target filament highlighting
-- 🔄 **Anti-Flickering** - Stable UI using sticky values for intermittent MQTT data
+- 🛡️ **Dual-Layer Watchdog** - Detects and recovers from hung MQTT/camera connections
 
 ## Quick Start
 

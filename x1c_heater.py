@@ -3,6 +3,7 @@ import threading
 import sys
 import json
 import os
+import select
 from datetime import datetime
 from w1thermsensor import W1ThermSensor, SensorNotReadyError
 from simple_pid import PID
@@ -168,6 +169,7 @@ camera_streaming = False
 camera_lock = threading.Lock()
 camera_frame = None  # Latest frame for serving to clients
 camera_frame_lock = threading.Lock()
+last_frame_time = 0  # Track when we last received a frame (for watchdog)
 
 # DS18B20 Setup
 try:
@@ -1277,10 +1279,34 @@ def printer_monitor():
 
     def on_disconnect(client, userdata, rc, *args):
         global printer_connected
-        print(f"Disconnected from printer MQTT (code: {rc})")
+        global last_file_name, last_progress, last_time_remaining, last_material
+        global last_ams_slots, last_external_spool, last_tray_now
+
+        if rc == 0:
+            print(f"Disconnected from printer MQTT (clean disconnect)")
+        else:
+            print(f"Disconnected from printer MQTT (code: {rc}) - will attempt reconnection")
+
         with printer_lock:
             printer_connected = False
             status_data['printer_connected'] = False
+
+            # Clear sticky values so old data doesn't persist
+            last_file_name = ''
+            last_progress = 0
+            last_time_remaining = 0
+            last_material = ''
+            last_ams_slots = ['', '', '', '']
+            last_external_spool = ''
+            last_tray_now = -1
+
+            # Clear printer status display
+            status_data['printer_phase'] = 'idle'
+            status_data['printer_file'] = ''
+            status_data['printer_material'] = ''
+            status_data['printer_progress'] = 0
+            status_data['printer_time_remaining'] = 0
+
         emit_status_update()
 
     def on_message(client, userdata, msg):
@@ -1705,30 +1731,72 @@ def printer_monitor():
         printer_mqtt_client.on_connect = on_connect
         printer_mqtt_client.on_disconnect = on_disconnect
         printer_mqtt_client.on_message = on_message
+
+        # Enable automatic reconnection with exponential backoff
+        # min_delay=1 sec, max_delay=120 sec (2 minutes)
+        printer_mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
+        print("Automatic reconnection enabled (1-120 sec backoff)")
     except Exception as e:
         print(f"ERROR: Failed to configure MQTT client: {e}")
         return
 
-    # Initial connection
-    try:
-        print(f"Connecting to printer at {printer_ip}:8883...", flush=True)
-        printer_mqtt_client.connect(printer_ip, 8883, 60)
-        printer_mqtt_client.loop_start()
-        print("MQTT loop started", flush=True)
-    except Exception as e:
-        print(f"Initial MQTT connection failed: {e}", flush=True)
+    # Connection monitoring loop with robust reconnection
+    reconnect_attempts = 0
+    max_reconnect_attempts = 5
+    last_connection_attempt = 0
+    connection_retry_interval = 10  # seconds between connection attempts
 
-    # Connection monitoring loop with auto-reconnect
     while not shutdown_requested:
         try:
-            if not printer_connected:
-                print(f"Reconnecting to printer at {printer_ip}:8883...")
-                printer_mqtt_client.reconnect()
+            current_time = time.time()
 
+            # If not connected and enough time has passed since last attempt
+            if not printer_connected and (current_time - last_connection_attempt) >= connection_retry_interval:
+                reconnect_attempts += 1
+                last_connection_attempt = current_time
+
+                print(f"[Attempt {reconnect_attempts}] Connecting to printer at {printer_ip}:8883...", flush=True)
+
+                try:
+                    # For initial connection or if reconnect() fails multiple times, use connect()
+                    if reconnect_attempts == 1 or reconnect_attempts > max_reconnect_attempts:
+                        # Stop the loop before reconnecting to avoid threading issues
+                        try:
+                            printer_mqtt_client.loop_stop()
+                        except:
+                            pass
+
+                        # Use connect_async for non-blocking connection
+                        printer_mqtt_client.connect_async(printer_ip, 8883, 60)
+                        printer_mqtt_client.loop_start()
+
+                        if reconnect_attempts > max_reconnect_attempts:
+                            reconnect_attempts = 1  # Reset counter after forced reconnect
+                            print(f"Using fresh connection attempt after {max_reconnect_attempts} failed reconnects")
+                    else:
+                        # Try reconnect() for subsequent attempts (faster if connection state is valid)
+                        printer_mqtt_client.reconnect()
+
+                except OSError as e:
+                    print(f"Connection failed (printer may be offline): {e}")
+                    with printer_lock:
+                        printer_connected = False
+                        status_data['printer_connected'] = False
+                except Exception as e:
+                    print(f"Connection error: {e}")
+                    with printer_lock:
+                        printer_connected = False
+                        status_data['printer_connected'] = False
+
+            # If connected, reset reconnection counter
+            if printer_connected:
+                reconnect_attempts = 0
+
+            # Sleep before next check
             time.sleep(5)
 
         except Exception as e:
-            print(f"Printer MQTT error: {e}")
+            print(f"Printer monitor error: {e}")
             with printer_lock:
                 printer_connected = False
                 status_data['printer_connected'] = False
@@ -2901,6 +2969,7 @@ HTML_TEMPLATE = """
         let previousPauseState = false; // Track pause state for notifications
         let previousAwaitingPreheat = false; // Track preheat confirmation state
         let isFireAlarmActive = false; // Track fire alarm state to block controls
+        let previousCameraStreaming = false; // Track camera streaming state for auto-reconnect
 
         /* Anti-Flicker System (Two Layers of Protection)
          *
@@ -4970,6 +5039,27 @@ HTML_TEMPLATE = """
 
             // Update Printer Status Card
             updatePrinterStatusCard(data);
+
+            // Auto-reload camera feed when stream reconnects
+            if (data.camera_streaming && !previousCameraStreaming) {
+                console.log('📷 Camera stream reconnected - reloading feed');
+                const cameraImg = document.getElementById('camera-feed');
+                const cameraPip = document.getElementById('camera-pip');
+
+                // Only reload if camera PiP is visible
+                if (cameraImg && !cameraPip.classList.contains('hidden')) {
+                    const placeholder = document.getElementById('camera-placeholder');
+                    placeholder.textContent = 'Reconnecting...';
+                    placeholder.style.display = 'flex';
+                    cameraImg.style.display = 'none';
+
+                    // Reload camera feed with new timestamp to force fresh connection
+                    cameraImg.src = '/printer/camera/feed?' + new Date().getTime();
+                }
+            }
+
+            // Update previous camera state
+            previousCameraStreaming = data.camera_streaming || false;
         });
 
         // Real-time notification events
@@ -5520,9 +5610,11 @@ def printer_stop():
 def camera_monitor():
     """Background thread that keeps camera stream running when printer is configured.
     Stores latest frame in shared buffer for clients to read."""
-    global camera_process, camera_streaming, camera_frame
+    global camera_process, camera_streaming, camera_frame, last_frame_time
 
     print("Camera monitor thread started")
+
+    STREAM_TIMEOUT = 30  # Seconds - if no frames for this long, restart stream
 
     while not shutdown_requested:
         try:
@@ -5536,10 +5628,30 @@ def camera_monitor():
                 time.sleep(5)
                 continue
 
-            # Start FFmpeg if not running
+            # Check if FFmpeg is running
             with camera_lock:
-                if camera_process is not None and camera_process.poll() is None:
-                    # Already running, wait a bit
+                process_alive = camera_process is not None and camera_process.poll() is None
+
+                # Watchdog: If process is alive but no frames for STREAM_TIMEOUT seconds, it's hung
+                if process_alive:
+                    time_since_last_frame = time.time() - last_frame_time
+                    if last_frame_time > 0 and time_since_last_frame > STREAM_TIMEOUT:
+                        print(f"📷 Camera stream appears hung ({int(time_since_last_frame)}s no frames), forcing restart...")
+                        try:
+                            camera_process.kill()  # Force kill instead of terminate
+                            camera_process.wait(timeout=2)
+                        except:
+                            pass
+                        camera_process = None
+                        camera_streaming = False
+                        status_data['camera_streaming'] = False
+                        last_frame_time = 0
+                        emit_status_update()
+                        time.sleep(2)
+                        continue
+
+                # If already running and healthy, just wait
+                if process_alive:
                     time.sleep(1)
                     continue
 
@@ -5553,6 +5665,7 @@ def camera_monitor():
                 camera_process = subprocess.Popen([
                     'ffmpeg',
                     '-rtsp_transport', 'tcp',
+                    '-timeout', '10000000',  # 10 second timeout for initial connection (in microseconds)
                     '-i', stream_url,
                     '-f', 'image2pipe',
                     '-vcodec', 'mjpeg',
@@ -5566,7 +5679,8 @@ def camera_monitor():
 
             if camera_process.poll() is not None:
                 stderr_output = camera_process.stderr.read().decode('utf-8', errors='ignore')
-                print(f"Camera stream failed to start: {stderr_output[:200]}")
+                # Print last 1000 chars (the error is usually at the end, not in the FFmpeg banner)
+                print(f"📷 Camera stream failed to start:\n{stderr_output[-1000:]}")
                 with camera_lock:
                     camera_streaming = False
                     status_data['camera_streaming'] = False
@@ -5575,16 +5689,43 @@ def camera_monitor():
                 continue
 
             print("📷 Camera stream started successfully")
+            last_frame_time = time.time()  # Initialize watchdog timer
             emit_status_update()
 
             # Read frames continuously and store in shared buffer
             buffer = b''
-            while not shutdown_requested and camera_process.poll() is None:
-                chunk = camera_process.stdout.read(4096)
-                if not chunk:
-                    break
+            read_timeout = 2  # Check every 2 seconds if data is available
 
-                buffer += chunk
+            while not shutdown_requested and camera_process.poll() is None:
+                try:
+                    # Use select to wait for data with timeout (non-blocking read)
+                    readable, _, _ = select.select([camera_process.stdout], [], [], read_timeout)
+
+                    if not readable:
+                        # No data available after timeout - check if stream is hung
+                        time_since_last_frame = time.time() - last_frame_time
+                        if last_frame_time > 0 and time_since_last_frame > STREAM_TIMEOUT:
+                            print(f"📷 Camera stream hung ({int(time_since_last_frame)}s no frames), restarting...")
+                            break
+                        # Continue waiting for data
+                        continue
+
+                    # Data is available, read it
+                    chunk = camera_process.stdout.read(4096)
+                    if not chunk:
+                        break
+
+                    buffer += chunk
+                except Exception as select_error:
+                    print(f"📷 Camera error: {select_error}")
+                    # Fall back to blocking read on error
+                    try:
+                        chunk = camera_process.stdout.read(4096)
+                        if not chunk:
+                            break
+                        buffer += chunk
+                    except:
+                        break
 
                 # Extract JPEG frames (start: FFD8, end: FFD9)
                 while True:
@@ -5604,6 +5745,7 @@ def camera_monitor():
 
                     with camera_frame_lock:
                         camera_frame = frame
+                        last_frame_time = time.time()  # Update watchdog timestamp
 
             # FFmpeg stopped
             print("📷 Camera stream stopped, will restart...")
@@ -5619,7 +5761,7 @@ def camera_monitor():
             time.sleep(5)  # Wait before restart
 
         except Exception as e:
-            print(f"Camera monitor error: {e}", flush=True)
+            print(f"📷 Camera monitor error: {e}")
             with camera_lock:
                 camera_streaming = False
                 status_data['camera_streaming'] = False
